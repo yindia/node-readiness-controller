@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -55,10 +54,6 @@ type RuleReadinessController struct {
 	clientset              kubernetes.Interface
 	EventRecorder          events.EventRecorder
 	EnableNodeStateMetrics bool
-
-	// Cache for efficient rule lookup
-	ruleCacheMutex sync.RWMutex
-	ruleCache      map[string]*readinessv1alpha1.NodeReadinessRule // ruleName -> rule
 }
 
 // RuleReconciler handles NodeReadinessRule reconciliation.
@@ -77,7 +72,6 @@ func NewRuleReadinessController(mgr ctrl.Manager, clientset kubernetes.Interface
 		clientset:              clientset,
 		EventRecorder:          mgr.GetEventRecorder("node-readiness-controller"),
 		EnableNodeStateMetrics: enableNodeStateMetrics,
-		ruleCache:              make(map[string]*readinessv1alpha1.NodeReadinessRule),
 	}
 }
 
@@ -105,8 +99,8 @@ func (r *RuleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	rule := &readinessv1alpha1.NodeReadinessRule{}
 	if err := r.Get(ctx, req.NamespacedName, rule); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("Rule not found, removing from cache", "rule", req.Name)
-			r.Controller.removeRuleFromCache(ctx, req.Name)
+			log.Info("Rule not found", "rule", req.Name)
+			r.Controller.refreshRulesTotal(ctx)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -135,8 +129,7 @@ func (r *RuleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return r.reconcileDelete(ctx, rule, nodeList)
 	}
 
-	// Update rule cache (after cleanup)
-	r.Controller.updateRuleCache(ctx, rule)
+	r.Controller.refreshRulesTotal(ctx)
 
 	// Handle dry run
 	if rule.Spec.DryRun {
@@ -179,23 +172,15 @@ func (r *RuleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 // reconcileDelete handles the rules deletion, It performs following actions
 // 1. Deletes the taints associated with the rule.
-// 2. Remove the rule from the cache.
-// 3. Remove the finalizer from the rule.
+// 2. Remove the finalizer from the rule.
 func (r *RuleReconciler) reconcileDelete(ctx context.Context, rule *readinessv1alpha1.NodeReadinessRule, nodeList *corev1.NodeList) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-
-	// Update cache with deletion-marked rule before cleanup.
-	log.V(3).Info("Updating cache with deletion-marked rule before cleanup")
-	r.Controller.updateRuleCache(ctx, rule)
 
 	log.Info("Cleaning up taints for deleted rule", "rule", rule.Name)
 	if err := r.Controller.cleanupTaintsForRule(ctx, rule, nodeList); err != nil {
 		log.Error(err, "Failed to cleanup taints for rule", "rule", rule.Name)
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
-
-	log.V(3).Info("Removing the rule from cache")
-	r.Controller.removeRuleFromCache(ctx, rule.Name)
 
 	log.V(3).Info("Removing the finalizer from the rule")
 	patch := client.MergeFrom(rule.DeepCopy())
@@ -515,20 +500,58 @@ func (r *RuleReadinessController) updateNodeEvaluationStatus(
 	nodeEval.LastEvaluationTime = metav1.Now()
 }
 
-// getApplicableRulesForNode returns all rules applicable to a node.
-func (r *RuleReadinessController) getApplicableRulesForNode(ctx context.Context, node *corev1.Node) []*readinessv1alpha1.NodeReadinessRule {
-	r.ruleCacheMutex.RLock()
-	defer r.ruleCacheMutex.RUnlock()
+// rulesForNode returns every rule whose nodeSelector matches the node's labels.
+//
+// Rules are read from the manager's informer cache, which is the same cache the
+// rule watch delivers events from. That keeps the lookup consistent with the
+// event that triggered the reconcile, and means a rule is visible to the node
+// reconciler as soon as the informer has it, without waiting for the rule
+// reconciler to run first.
+//
+// The list is taken without deep copying, because a rule's status grows with
+// the number of nodes it matches and copying every rule on every node event
+// would allocate in proportion to the whole cluster.
+//
+// INVARIANT: ruleList.Items aliases the informer cache. Its items must never be
+// mutated and must never escape this function; only DeepCopy results may be
+// returned. Breaking this corrupts the cache for every controller in the
+// process, silently and non-deterministically. TestRulesForNode_DoesNotMutateCache
+// guards it.
+func (r *RuleReadinessController) rulesForNode(ctx context.Context, node *corev1.Node) ([]*readinessv1alpha1.NodeReadinessRule, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	ruleList := &readinessv1alpha1.NodeReadinessRuleList{}
+	if err := r.List(ctx, ruleList, client.UnsafeDisableDeepCopy); err != nil {
+		return nil, fmt.Errorf("failed to list rules for node %q: %w", node.Name, err)
+	}
+
+	nodeLabels := labels.Set(node.Labels)
 
 	var applicableRules []*readinessv1alpha1.NodeReadinessRule
+	for i := range ruleList.Items {
+		// Indexed access on purpose: no local handle to a cache-aliased rule.
+		selector, err := metav1.LabelSelectorAsSelector(&ruleList.Items[i].Spec.NodeSelector)
+		if err != nil {
+			log.Error(err, "Invalid node selector for rule", "rule", ruleList.Items[i].Name)
+			continue
+		}
 
-	for _, rule := range r.ruleCache {
-		if r.ruleAppliesTo(ctx, rule, node) {
-			applicableRules = append(applicableRules, rule.DeepCopy())
+		if selector.Matches(nodeLabels) {
+			applicableRules = append(applicableRules, ruleList.Items[i].DeepCopy())
 		}
 	}
 
-	return applicableRules
+	return applicableRules, nil
+}
+
+// refreshRulesTotal republishes the rules gauge from the informer cache.
+func (r *RuleReadinessController) refreshRulesTotal(ctx context.Context) {
+	ruleList := &readinessv1alpha1.NodeReadinessRuleList{}
+	if err := r.List(ctx, ruleList, client.UnsafeDisableDeepCopy); err != nil {
+		ctrl.LoggerFrom(ctx).V(4).Info("Failed to list rules for the rules gauge", "error", err.Error())
+		return
+	}
+	metrics.RulesTotal.Set(float64(len(ruleList.Items)))
 }
 
 // ListRuleNodeStates returns the number of held and released nodes for each rule.
@@ -588,32 +611,6 @@ func (r *RuleReadinessController) ruleAppliesTo(ctx context.Context, rule *readi
 	}
 
 	return selector.Matches(labels.Set(node.Labels))
-}
-
-// updateRuleCache updates the rule cache.
-func (r *RuleReadinessController) updateRuleCache(ctx context.Context, rule *readinessv1alpha1.NodeReadinessRule) {
-	log := ctrl.LoggerFrom(ctx)
-	r.ruleCacheMutex.Lock()
-	defer r.ruleCacheMutex.Unlock()
-
-	ruleCopy := rule.DeepCopy()
-	r.ruleCache[rule.Name] = ruleCopy
-	metrics.RulesTotal.Set(float64(len(r.ruleCache)))
-	log.V(4).Info("Updated rule cache",
-		"rule", rule.Name,
-		"totalRules", len(r.ruleCache),
-		"resourceVersion", ruleCopy.ResourceVersion)
-}
-
-// removeRuleFromCache removes a rule from cache.
-func (r *RuleReadinessController) removeRuleFromCache(ctx context.Context, ruleName string) {
-	log := ctrl.LoggerFrom(ctx)
-	r.ruleCacheMutex.Lock()
-	defer r.ruleCacheMutex.Unlock()
-
-	delete(r.ruleCache, ruleName)
-	metrics.RulesTotal.Set(float64(len(r.ruleCache)))
-	log.Info("Removed rule from cache", "rule", ruleName, "totalRules", len(r.ruleCache))
 }
 
 // updateRuleStatus updates the status of a NodeReadinessRule.

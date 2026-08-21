@@ -17,12 +17,16 @@ limitations under the License.
 package controller
 
 import (
+	"sort"
 	"testing"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	readinessv1alpha1 "sigs.k8s.io/node-readiness-controller/api/v1alpha1"
 )
@@ -126,45 +130,135 @@ func TestLabelsEqual(t *testing.T) {
 	}
 }
 
-func TestGetApplicableRulesForNode_DeepCopy(t *testing.T) {
+func TestRulesForNode(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := readinessv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to register scheme: %v", err)
+	}
+
+	mkRule := func(name string, sel metav1.LabelSelector) client.Object {
+		return &readinessv1alpha1.NodeReadinessRule{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       readinessv1alpha1.NodeReadinessRuleSpec{NodeSelector: sel},
+		}
+	}
+
+	rules := []client.Object{
+		mkRule("match-labels", metav1.LabelSelector{
+			MatchLabels: map[string]string{"env": "prod"},
+		}),
+		mkRule("other-value", metav1.LabelSelector{
+			MatchLabels: map[string]string{"env": "dev"},
+		}),
+		mkRule("match-expressions", metav1.LabelSelector{
+			MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key:      "env",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"prod", "staging"},
+			}},
+		}),
+		mkRule("accelerator-exists", metav1.LabelSelector{
+			MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key:      "accelerator",
+				Operator: metav1.LabelSelectorOpExists,
+			}},
+		}),
+		mkRule("invalid-selector", metav1.LabelSelector{
+			MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key:      "env",
+				Operator: metav1.LabelSelectorOperator("Bogus"),
+			}},
+		}),
+	}
+
+	tests := []struct {
+		name       string
+		nodeLabels map[string]string
+		want       []string
+	}{
+		{
+			name:       "matchLabels and matchExpressions both match",
+			nodeLabels: map[string]string{"env": "prod"},
+			want:       []string{"match-expressions", "match-labels"},
+		},
+		{
+			name:       "matchExpressions only",
+			nodeLabels: map[string]string{"env": "staging"},
+			want:       []string{"match-expressions"},
+		},
+		{
+			name:       "a different value selects the other rule",
+			nodeLabels: map[string]string{"env": "dev"},
+			want:       []string{"other-value"},
+		},
+		{
+			name:       "Exists matches on key presence regardless of value",
+			nodeLabels: map[string]string{"accelerator": "nvidia"},
+			want:       []string{"accelerator-exists"},
+		},
+		{
+			name:       "a node with no labels matches nothing",
+			nodeLabels: nil,
+			want:       []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			c := &RuleReadinessController{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(rules...).Build(),
+			}
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: tt.nodeLabels},
+			}
+
+			got, err := c.rulesForNode(t.Context(), node)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			names := make([]string, 0, len(got))
+			for _, r := range got {
+				names = append(names, r.Name)
+			}
+			sort.Strings(names)
+			g.Expect(names).To(Equal(tt.want))
+		})
+	}
+}
+
+func TestRulesForNode_ReturnedRulesAreIsolated(t *testing.T) {
 	g := NewWithT(t)
 
-	c := &RuleReadinessController{
-		ruleCache: make(map[string]*readinessv1alpha1.NodeReadinessRule),
-	}
+	scheme := runtime.NewScheme()
+	g.Expect(readinessv1alpha1.AddToScheme(scheme)).To(Succeed())
 
 	rule := &readinessv1alpha1.NodeReadinessRule{
 		ObjectMeta: metav1.ObjectMeta{Name: "rule-1"},
 		Spec: readinessv1alpha1.NodeReadinessRuleSpec{
-			NodeSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{"env": "prod"},
-			},
+			NodeSelector: metav1.LabelSelector{MatchLabels: map[string]string{"env": "prod"}},
 		},
-		Status: readinessv1alpha1.NodeReadinessRuleStatus{
-			AppliedNodes: []string{"node-1"},
-		},
+		Status: readinessv1alpha1.NodeReadinessRuleStatus{AppliedNodes: []string{"node-1"}},
 	}
 
-	ctx := t.Context()
-	c.updateRuleCache(ctx, rule)
-
+	c := &RuleReadinessController{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(rule).Build(),
+	}
 	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "node-1",
-			Labels: map[string]string{"env": "prod"},
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: map[string]string{"env": "prod"}},
 	}
+	ctx := t.Context()
 
-	rules := c.getApplicableRulesForNode(ctx, node)
-	g.Expect(rules).To(HaveLen(1))
+	first, err := c.rulesForNode(ctx, node)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(first).To(HaveLen(1))
 
-	// Mutate the returned rule's status
-	rules[0].Status.AppliedNodes = append(rules[0].Status.AppliedNodes, "node-2")
+	// Callers mutate the returned rules while building status. That must not be
+	// visible to a later lookup.
+	first[0].Status.AppliedNodes = append(first[0].Status.AppliedNodes, "node-2")
 
-	// Ensure the cached rule was isolated and not mutated
-	c.ruleCacheMutex.RLock()
-	cachedRule := c.ruleCache["rule-1"]
-	c.ruleCacheMutex.RUnlock()
-
-	g.Expect(cachedRule.Status.AppliedNodes).To(Equal([]string{"node-1"}))
+	second, err := c.rulesForNode(ctx, node)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(second).To(HaveLen(1))
+	g.Expect(second[0].Status.AppliedNodes).To(Equal([]string{"node-1"}))
 }

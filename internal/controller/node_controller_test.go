@@ -198,7 +198,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -228,7 +227,8 @@ var _ = Describe("Node Controller", func() {
 
 			rule = &nodereadinessiov1alpha1.NodeReadinessRule{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: ruleName,
+					Name:       ruleName,
+					Finalizers: []string{finalizerName},
 				},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
@@ -250,8 +250,6 @@ var _ = Describe("Node Controller", func() {
 			Expect(k8sClient.Create(ctx, node)).To(Succeed())
 			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
 
-			// Manually add rule to cache to simulate RuleReconciler
-			readinessController.updateRuleCache(ctx, rule)
 		})
 
 		AfterEach(func() {
@@ -272,8 +270,6 @@ var _ = Describe("Node Controller", func() {
 				return apierrors.IsNotFound(err)
 			}, time.Second*10).Should(BeTrue())
 
-			// Remove rule from cache
-			readinessController.removeRuleFromCache(ctx, ruleName)
 		})
 
 		When("in bootstrap-only mode", func() {
@@ -484,7 +480,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -497,7 +492,8 @@ var _ = Describe("Node Controller", func() {
 
 			rule = &nodereadinessiov1alpha1.NodeReadinessRule{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: ruleName,
+					Name:       ruleName,
+					Finalizers: []string{finalizerName},
 				},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
@@ -554,18 +550,14 @@ var _ = Describe("Node Controller", func() {
 				return apierrors.IsNotFound(err)
 			}, time.Second*10).Should(BeTrue())
 
-			// Remove rule from cache
-			readinessController.removeRuleFromCache(ctx, ruleName)
 		})
 
 		It("should not add taints when rule has DeletionTimestamp set", func() {
 			// mark rule for deletion
-			By("Creating rule with DeletionTimestamp")
+			By("Deleting the rule so the API server sets its DeletionTimestamp")
+			// The rule carries the cleanup finalizer, so it stays readable with a
+			// DeletionTimestamp set rather than disappearing outright.
 			Expect(k8sClient.Delete(ctx, rule)).To(Succeed())
-			deletingRule := rule.DeepCopy()
-			now := metav1.Now()
-			deletingRule.DeletionTimestamp = &now
-			readinessController.updateRuleCache(ctx, deletingRule)
 
 			By("Triggering NodeReconciler") // should skip because rule is being deleted
 			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
@@ -587,11 +579,8 @@ var _ = Describe("Node Controller", func() {
 		})
 
 		It("should skip rule evaluation completely when DeletionTimestamp is set", func() {
-			By("Creating rule with DeletionTimestamp")
-			deletingRule := rule.DeepCopy()
-			now := metav1.Now()
-			deletingRule.DeletionTimestamp = &now
-			readinessController.updateRuleCache(ctx, deletingRule)
+			By("Deleting the rule so the API server sets its DeletionTimestamp")
+			Expect(k8sClient.Delete(ctx, rule)).To(Succeed())
 
 			By("Triggering reconciliation")
 			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
@@ -634,7 +623,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -665,7 +653,8 @@ var _ = Describe("Node Controller", func() {
 
 			rule = &nodereadinessiov1alpha1.NodeReadinessRule{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "status-test-rule",
+					Name:       "status-test-rule",
+					Finalizers: []string{finalizerName},
 				},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
@@ -688,8 +677,6 @@ var _ = Describe("Node Controller", func() {
 			Expect(k8sClient.Create(ctx, node)).To(Succeed())
 			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
 
-			// Add rule to cache to simulate RuleReconciler having processed it
-			readinessController.updateRuleCache(ctx, rule)
 		})
 
 		AfterEach(func() {
@@ -707,7 +694,6 @@ var _ = Describe("Node Controller", func() {
 				return apierrors.IsNotFound(err)
 			}, time.Second*10).Should(BeTrue())
 
-			readinessController.removeRuleFromCache(ctx, "status-test-rule")
 		})
 
 		It("should persist NodeEvaluation with expected structure to rule.status", func() {
@@ -853,7 +839,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -921,14 +906,13 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
 			Expect(fc.Get(ctx, types.NamespacedName{Name: node.Name}, node)).To(Succeed())
 
 			addRule := &nodereadinessiov1alpha1.NodeReadinessRule{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-rule"},
+				ObjectMeta: metav1.ObjectMeta{Name: "test-rule", Finalizers: []string{finalizerName}},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					Taint:           corev1.Taint{Key: "readiness.k8s.io/test", Effect: corev1.TaintEffectNoSchedule},
 					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
@@ -963,8 +947,9 @@ var _ = Describe("Node Controller", func() {
 
 			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "race-mark-rule",
-					UID:  types.UID("77777777-7777-7777-7777-777777777777"),
+					Name:       "race-mark-rule",
+					Finalizers: []string{finalizerName},
+					UID:        types.UID("77777777-7777-7777-7777-777777777777"),
 				},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					Taint:           corev1.Taint{Key: "readiness.k8s.io/race-test", Effect: corev1.TaintEffectNoSchedule},
@@ -999,7 +984,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1018,8 +1002,9 @@ var _ = Describe("Node Controller", func() {
 
 			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "race-add-rule",
-					UID:  types.UID("88888888-8888-8888-8888-888888888888"),
+					Name:       "race-add-rule",
+					UID:        types.UID("88888888-8888-8888-8888-888888888888"),
+					Finalizers: []string{finalizerName},
 				},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					Taint:           corev1.Taint{Key: "readiness.k8s.io/race-test", Effect: corev1.TaintEffectNoSchedule},
@@ -1057,7 +1042,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1094,7 +1078,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1141,7 +1124,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1178,7 +1160,7 @@ var _ = Describe("Node Controller", func() {
 			}
 
 			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
-				ObjectMeta: metav1.ObjectMeta{Name: "requeue-test-rule"},
+				ObjectMeta: metav1.ObjectMeta{Name: "requeue-test-rule", Finalizers: []string{finalizerName}},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
 						{Type: "Ready", RequiredStatus: corev1.ConditionTrue},
@@ -1207,10 +1189,8 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
-			controller.updateRuleCache(ctx, rule)
 
 			nodeReconciler := &NodeReconciler{
 				Client:     fc,
@@ -1244,10 +1224,10 @@ var _ = Describe("Node Controller", func() {
 			// so evaluateRuleForNode will call addTaintBySpec. We intercept
 			// Patch to return an error, forcing the failure path.
 			node := &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: "metrics-fail-node"},
+				ObjectMeta: metav1.ObjectMeta{Name: "metrics-fail-node", Finalizers: []string{finalizerName}},
 			}
 			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
-				ObjectMeta: metav1.ObjectMeta{Name: "metrics-fail-rule"},
+				ObjectMeta: metav1.ObjectMeta{Name: "metrics-fail-rule", Finalizers: []string{finalizerName}},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					NodeSelector: metav1.LabelSelector{},
 					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
@@ -1279,7 +1259,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     map[string]*nodereadinessiov1alpha1.NodeReadinessRule{rule.Name: rule},
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1311,7 +1290,7 @@ var _ = Describe("Node Controller", func() {
 				},
 			}
 			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
-				ObjectMeta: metav1.ObjectMeta{Name: "recovery-rule"},
+				ObjectMeta: metav1.ObjectMeta{Name: "recovery-rule", Finalizers: []string{finalizerName}},
 				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
 					NodeSelector: metav1.LabelSelector{},
 					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
@@ -1344,7 +1323,6 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     map[string]*nodereadinessiov1alpha1.NodeReadinessRule{rule.Name: rule},
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 

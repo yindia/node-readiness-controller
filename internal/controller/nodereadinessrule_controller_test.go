@@ -89,7 +89,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			Client:        k8sClient,
 			Scheme:        scheme,
 			clientset:     fakeClientset,
-			ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 			EventRecorder: events.NewFakeRecorder(10),
 		}
 
@@ -181,18 +180,17 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				return err
 			}).Should(Succeed())
 
-			// Verify rule is in cache
-			readinessController.ruleCacheMutex.RLock()
-			cachedRule, exists := readinessController.ruleCache["test-rule"]
-			readinessController.ruleCacheMutex.RUnlock()
-			Expect(exists).To(BeTrue())
-			Expect(cachedRule.Spec.Taint.Key).To(Equal("readiness.k8s.io/test-taint"))
+			// The reconcile must leave the rule finalized and intact.
+			reconciled := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rule"}, reconciled)).To(Succeed())
+			Expect(reconciled.Finalizers).To(ContainElement(finalizerName))
+			Expect(reconciled.Spec.Taint.Key).To(Equal("readiness.k8s.io/test-taint"))
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, rule)).To(Succeed())
 		})
 
-		It("should handle rule deletion and remove from cache", func() {
+		It("should handle rule deletion and clean up the finalizer", func() {
 			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "test-rule-delete",
@@ -233,10 +231,9 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				readinessController.ruleCacheMutex.RLock()
-				_, exists := readinessController.ruleCache["test-rule-delete"]
-				readinessController.ruleCacheMutex.RUnlock()
-				return !exists
+				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-rule-delete"},
+					&nodereadinessiov1alpha1.NodeReadinessRule{})
+				return apierrors.IsNotFound(err)
 			}).Should(BeTrue())
 		})
 
@@ -1021,9 +1018,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, rule) }()
 
-			// First add rule to cache
-			readinessController.updateRuleCache(ctx, rule)
-
 			// Process node
 			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: "test-node"},
@@ -1600,9 +1594,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 		It("should trigger reconciliation for existing rules", func() {
 			// Create the new node, which should trigger the watch
 			Expect(k8sClient.Create(ctx, newNode)).To(Succeed())
-
-			// Add the rule to the cache
-			readinessController.updateRuleCache(ctx, rule)
 
 			// Manually trigger rule reconciliation to simulate watch behavior
 			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{
@@ -2356,7 +2347,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				Client:        errClient,
 				Scheme:        scheme,
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -2413,7 +2403,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				Client:        k8sClient,
 				Scheme:        scheme,
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -2471,7 +2460,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 		})
 
 		It("anyOf: removes taint when at least one condition is satisfied", func() {
-			readinessController.updateRuleCache(ctx, rule)
 
 			Expect(k8sClient.Create(ctx, anyOfNode)).To(Succeed())
 			defer func() { Expect(k8sClient.Delete(ctx, anyOfNode)).To(Succeed()) }()
@@ -2492,8 +2480,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			anyOfNode.Spec.Taints = nil
 			anyOfNode.Status.Conditions[0].Status = corev1.ConditionFalse
 
-			readinessController.updateRuleCache(ctx, rule)
-
 			Expect(k8sClient.Create(ctx, anyOfNode)).To(Succeed())
 			defer func() { Expect(k8sClient.Delete(ctx, anyOfNode)).To(Succeed()) }()
 			Expect(readinessController.evaluateRuleForNode(ctx, rule, anyOfNode)).To(Succeed())
@@ -2509,8 +2495,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			// Node has no taint; controller should add one
 			anyOfNode.Spec.Taints = nil
 
-			readinessController.updateRuleCache(ctx, rule)
-
 			Expect(k8sClient.Create(ctx, anyOfNode)).To(Succeed())
 			defer func() { Expect(k8sClient.Delete(ctx, anyOfNode)).To(Succeed()) }()
 			Expect(readinessController.evaluateRuleForNode(ctx, rule, anyOfNode)).To(Succeed())
@@ -2524,8 +2508,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 
 			// Set both conditions to True to satisfy allOf
 			anyOfNode.Status.Conditions[1].Status = corev1.ConditionTrue
-
-			readinessController.updateRuleCache(ctx, rule)
 
 			Expect(k8sClient.Create(ctx, anyOfNode)).To(Succeed())
 			defer func() { Expect(k8sClient.Delete(ctx, anyOfNode)).To(Succeed()) }()

@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -114,13 +115,16 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context, node *corev1.Node) error {
 	log := ctrl.LoggerFrom(ctx)
 
-	// Get all known (cached) applicable rules for this node
-	applicableRules := r.getApplicableRulesForNode(ctx, node)
+	// Rules whose nodeSelector matches this node, read from the informer cache.
+	applicableRules, err := r.rulesForNode(ctx, node)
+	if err != nil {
+		return err
+	}
 	var errs []error
 	log.Info("Processing node against rules", "node", node.Name, "ruleCount", len(applicableRules))
 
 	for _, rule := range applicableRules {
-		log.V(4).Info("Processing rule from cache",
+		log.V(4).Info("Processing rule",
 			"node", node.Name,
 			"rule", rule.Name,
 			"resourceVersion", rule.ResourceVersion,
@@ -128,6 +132,17 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 
 		if !rule.DeletionTimestamp.IsZero() {
 			log.V(4).Info("Skipping rule being deleted",
+				"node", node.Name,
+				"rule", rule.Name)
+			continue
+		}
+
+		// A rule only owns taints once it carries the cleanup finalizer, which the
+		// rule reconciler adds before it evaluates any node. Skipping rules without
+		// it keeps the invariant that a taint is never applied under a rule that
+		// would leave it behind if deleted immediately after creation.
+		if !controllerutil.ContainsFinalizer(rule, finalizerName) {
+			log.V(4).Info("Skipping rule without cleanup finalizer",
 				"node", node.Name,
 				"rule", rule.Name)
 			continue
