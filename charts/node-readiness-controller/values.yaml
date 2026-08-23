@@ -86,6 +86,10 @@ serviceAccount:
   create: true
   name: ""
   annotations: {}
+  # -- Mount the SA token into the pod. Controller needs API access, so
+  # default is true. Set false if a Gatekeeper policy forbids automounting
+  # (a projected/bound token must then be provided another way).
+  automountServiceAccountToken: true
 
 # Enable leader election to support multiple replicas
 leaderElection:
@@ -160,6 +164,33 @@ validatingWebhook:
   path: /validate-readiness-node-x-k8s-io-v1alpha1-nodereadinessrule
   admissionReviewVersions:
     - v1
+
+# Extra volumes and mounts on the manager pod/container.
+# To run with automountServiceAccountToken=false you MUST re-create the full
+# in-cluster credential set (token + ca.crt + namespace) at the standard path,
+# or rest.InClusterConfig() fails (missing token = hard error; missing ca.crt =
+# TLS verification failure against the API server).
+extraVolumes: []
+#   - name: sa-token
+#     projected:
+#       sources:
+#         - serviceAccountToken:
+#             path: token
+#             expirationSeconds: 3600
+#         - configMap:
+#             name: kube-root-ca.crt
+#             items:
+#               - key: ca.crt
+#                 path: ca.crt
+#         - downwardAPI:
+#             items:
+#               - path: namespace
+#                 fieldRef:
+#                   fieldPath: metadata.namespace
+extraVolumeMounts: []
+#   - name: sa-token
+#     mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+#     readOnly: true
 
 nodeSelector: {}
 
