@@ -122,6 +122,91 @@ Total number of nodes that have completed bootstrap.
 | --- | --- | --- |
 | `rule` | `NodeReadinessRule` name | Any rule name |
 
+### `node_readiness_bootstrap_duration_seconds`
+
+Time from node creation to bootstrap completion (taint removal) for bootstrap-only rules.
+
+| Property | Value |
+| --- | --- |
+| Type | `histogram` |
+| Labels | `rule` |
+| Buckets | `1, 5, 10, 30, 60, 120, 300, 600, 1200` seconds |
+| Recorded when | The controller removes the bootstrap taint from a node under a bootstrap-only rule |
+
+#### Labels
+
+| Label | Description | Values |
+| --- | --- | --- |
+| `rule` | `NodeReadinessRule` name | Any rule name |
+
+### `node_readiness_reconciliation_latency_seconds`
+
+End-to-end latency from a node condition change to the taint operation that responds to it.
+
+| Property | Value |
+| --- | --- |
+| Type | `histogram` |
+| Labels | `rule`, `operation` |
+| Buckets | `0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300` seconds |
+| Recorded when | The controller adds or removes a taint after a node condition change |
+
+#### Labels
+
+| Label | Description | Values |
+| --- | --- | --- |
+| `rule` | `NodeReadinessRule` name | Any rule name |
+| `operation` | Taint operation that closed the reconciliation | `add_taint`, `remove_taint` |
+
+### `node_readiness_nodes_by_state`
+
+Number of nodes in each readiness state per rule.
+
+| Property | Value |
+| --- | --- |
+| Type | `gauge` |
+| Labels | `rule`, `state` |
+| Recorded when | The controller syncs node state, including on each rule reconciliation |
+
+#### Labels
+
+| Label | Description | Values |
+| --- | --- | --- |
+| `rule` | `NodeReadinessRule` name | Any rule name |
+| `state` | Readiness state of the counted nodes | `ready`, `not_ready`, `bootstrapping` |
+
+### `node_readiness_condition_failures_total`
+
+Total number of failed condition evaluations, broken down by the condition that failed. Use this to find which check within a rule is blocking node readiness.
+
+| Property | Value |
+| --- | --- |
+| Type | `counter` |
+| Labels | `rule`, `condition` |
+| Recorded when | The controller evaluates a rule condition against a node and the condition is not met |
+
+#### Labels
+
+| Label | Description | Values |
+| --- | --- | --- |
+| `rule` | `NodeReadinessRule` name | Any rule name |
+| `condition` | Type of the condition that failed | Any condition type defined on the rule |
+
+### `node_readiness_rule_last_reconciliation_timestamp_seconds`
+
+Unix timestamp of the last reconciliation for each rule. Use this to detect rules that have stopped reconciling.
+
+| Property | Value |
+| --- | --- |
+| Type | `gauge` |
+| Labels | `rule` |
+| Recorded when | The controller reconciles the rule |
+
+#### Labels
+
+| Label | Description | Values |
+| --- | --- | --- |
+| `rule` | `NodeReadinessRule` name | Any rule name |
+
 ## Reporter Metrics
 
 The `readiness-condition-reporter` serves its own Prometheus metrics on `/metrics`, on the address configured by `METRICS_BIND_ADDRESS`. See [Reporter Configuration](../reference/reporter-configuration.md) for deployment details.
