@@ -106,27 +106,42 @@ func taintsEqual(a, b []corev1.Taint) bool {
 	return true
 }
 
-// filters nodeEvaluations and failedNodes to keep only existing nodes.
-func filterStatusForExistingNodes(
+// filterFailedNodesForExisting keeps only failures for nodes that still exist.
+func filterFailedNodesForExisting(
 	existingNodes map[string]bool,
-	nodeEvaluations []readinessv1alpha1.NodeEvaluation,
 	failedNodes []readinessv1alpha1.NodeFailure,
-) ([]readinessv1alpha1.NodeEvaluation, []readinessv1alpha1.NodeFailure) {
-	filteredEvaluations := make([]readinessv1alpha1.NodeEvaluation, 0, len(nodeEvaluations))
-	for _, evaluation := range nodeEvaluations {
-		if existingNodes[evaluation.NodeName] {
-			filteredEvaluations = append(filteredEvaluations, evaluation)
-		}
-	}
-
-	filteredFailedNodes := make([]readinessv1alpha1.NodeFailure, 0, len(failedNodes))
+) []readinessv1alpha1.NodeFailure {
+	filtered := make([]readinessv1alpha1.NodeFailure, 0, len(failedNodes))
 	for _, failure := range failedNodes {
 		if existingNodes[failure.NodeName] {
-			filteredFailedNodes = append(filteredFailedNodes, failure)
+			filtered = append(filtered, failure)
 		}
 	}
+	return filtered
+}
 
-	return filteredEvaluations, filteredFailedNodes
+// failedNodesEqual compares two NodeFailure lists by identity (node, reason,
+// message), ignoring timestamps, so a persistently-failing node with an
+// unchanged reason does not churn the rule status on every reconcile.
+func failedNodesEqual(a, b []readinessv1alpha1.NodeFailure) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(f readinessv1alpha1.NodeFailure) string {
+		return f.NodeName + "\x00" + f.Reason + "\x00" + f.Message
+	}
+	seen := make(map[string]int, len(a))
+	for _, f := range a {
+		seen[key(f)]++
+	}
+	for _, f := range b {
+		k := key(f)
+		if seen[k] == 0 {
+			return false
+		}
+		seen[k]--
+	}
+	return true
 }
 
 // labelsEqual checks if two label maps are equal.

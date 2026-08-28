@@ -39,6 +39,7 @@ import (
 
 	nodereadinessiov1alpha1 "sigs.k8s.io/node-readiness-controller/api/v1alpha1"
 	"sigs.k8s.io/node-readiness-controller/internal/metrics"
+	"sigs.k8s.io/node-readiness-controller/internal/snapshot"
 )
 
 var _ = Describe("Node Controller", func() {
@@ -198,7 +199,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -484,7 +485,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -597,20 +598,18 @@ var _ = Describe("Node Controller", func() {
 			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying rule was not evaluated")
-			// Check that no NodeEvaluation was added for this node
-			checkRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ruleName}, checkRule)).To(Succeed())
-
-			hasEval := false
-			for _, eval := range checkRule.Status.NodeEvaluations {
-				if eval.NodeName == nodeName {
-					hasEval = true
+			By("Verifying the deleting rule took no taint action on the node")
+			checkNode := &corev1.Node{}
+			Expect(k8sClient.Get(ctx, namespacedName, checkNode)).To(Succeed())
+			hasTaint := false
+			for _, t := range checkNode.Spec.Taints {
+				if t.Key == taintKey {
+					hasTaint = true
 					break
 				}
 			}
-			Expect(hasEval).To(BeFalse(),
-				"Rule with DeletionTimestamp should not create node evaluation")
+			Expect(hasTaint).To(BeFalse(),
+				"Rule with DeletionTimestamp should not add a taint")
 		})
 	})
 
@@ -634,7 +633,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -710,60 +709,29 @@ var _ = Describe("Node Controller", func() {
 			readinessController.removeRuleFromCache(ctx, "status-test-rule")
 		})
 
-		It("should persist NodeEvaluation with expected structure to rule.status", func() {
+		It("should keep the taint and claim ownership when the condition is unmet", func() {
 			By("Triggering NodeReconciler")
 			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying NodeEvaluation is persisted in rule status")
-			Eventually(func() bool {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "status-test-rule"}, updatedRule); err != nil {
-					return false
-				}
-
-				for _, eval := range updatedRule.Status.NodeEvaluations {
-					if eval.NodeName == "status-test-node" {
-						return true
-					}
-				}
-				return false
-			}, time.Second*5).Should(BeTrue(), "NodeEvaluation should be persisted for the node")
-
-			By("Verifying NodeEvaluation has all expected fields")
-			updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "status-test-rule"}, updatedRule)).To(Succeed())
-
-			var nodeEval *nodereadinessiov1alpha1.NodeEvaluation
-			for i := range updatedRule.Status.NodeEvaluations {
-				if updatedRule.Status.NodeEvaluations[i].NodeName == "status-test-node" {
-					nodeEval = &updatedRule.Status.NodeEvaluations[i]
-					break
+			By("Verifying the taint remains and is recorded in the ownership ledger")
+			updatedNode := &corev1.Node{}
+			Expect(k8sClient.Get(ctx, namespacedName, updatedNode)).To(Succeed())
+			hasTaint := false
+			for _, t := range updatedNode.Spec.Taints {
+				if t.Key == "readiness.k8s.io/status-test-taint" {
+					hasTaint = true
 				}
 			}
-
-			Expect(nodeEval).NotTo(BeNil(), "NodeEvaluation should exist")
-			Expect(nodeEval.ConditionResults).To(HaveLen(1), "Should have evaluation for 1 condition")
-			Expect(nodeEval.ConditionResults[0].Type).To(Equal("StatusTestCondition"))
-			Expect(nodeEval.ConditionResults[0].CurrentStatus).To(Equal(corev1.ConditionFalse))
-			Expect(nodeEval.ConditionResults[0].RequiredStatus).To(Equal(corev1.ConditionTrue))
-			Expect(nodeEval.ConditionResults[0].DefaultStatus).To(Equal(corev1.ConditionUnknown))
-			Expect(nodeEval.TaintStatus).To(Equal(nodereadinessiov1alpha1.TaintStatusPresent))
-			Expect(nodeEval.LastEvaluationTime.IsZero()).To(BeFalse(), "LastEvaluationTime should be set")
+			Expect(hasTaint).To(BeTrue(), "taint should remain while the condition is unmet")
+			_, owned := ownedTaintIDs(updatedNode)[taintID(corev1.Taint{Key: "readiness.k8s.io/status-test-taint", Effect: corev1.TaintEffectNoSchedule})]
+			Expect(owned).To(BeTrue(), "adopted taint should be recorded in the ledger")
 		})
 
-		It("should update existing NodeEvaluation when node is re-evaluated", func() {
-			By("First reconciliation - create initial evaluation")
+		It("should remove the taint when the node becomes ready", func() {
+			By("First reconciliation - condition unmet, taint kept")
 			_, err := nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
 			Expect(err).NotTo(HaveOccurred())
-
-			Eventually(func() int {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "status-test-rule"}, updatedRule); err != nil {
-					return 0
-				}
-				return len(updatedRule.Status.NodeEvaluations)
-			}, time.Second*5).Should(Equal(1))
 
 			By("Updating node condition to satisfy rule")
 			updatedNode := &corev1.Node{}
@@ -771,25 +739,24 @@ var _ = Describe("Node Controller", func() {
 			updatedNode.Status.Conditions[0].Status = corev1.ConditionTrue
 			Expect(k8sClient.Status().Update(ctx, updatedNode)).To(Succeed())
 
-			By("Second reconciliation - update existing evaluation")
+			By("Second reconciliation - condition met, taint removed")
 			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying NodeEvaluation was updated")
+			By("Verifying the taint and its ledger entry are gone")
 			Eventually(func() bool {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "status-test-rule"}, updatedRule); err != nil {
+				n := &corev1.Node{}
+				if err := k8sClient.Get(ctx, namespacedName, n); err != nil {
 					return false
 				}
-
-				if len(updatedRule.Status.NodeEvaluations) != 1 {
-					return false
+				for _, t := range n.Spec.Taints {
+					if t.Key == "readiness.k8s.io/status-test-taint" {
+						return false
+					}
 				}
-
-				nodeEval := updatedRule.Status.NodeEvaluations[0]
-				return nodeEval.ConditionResults[0].CurrentStatus == corev1.ConditionTrue &&
-					nodeEval.TaintStatus == nodereadinessiov1alpha1.TaintStatusAbsent
-			}, time.Second*5).Should(BeTrue(), "NodeEvaluation should be updated with new condition and taint status")
+				_, owned := ownedTaintIDs(n)[taintID(corev1.Taint{Key: "readiness.k8s.io/status-test-taint", Effect: corev1.TaintEffectNoSchedule})]
+				return !owned
+			}, time.Second*5).Should(BeTrue(), "taint and ledger entry should be removed once ready")
 		})
 	})
 
@@ -853,7 +820,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -921,7 +888,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -999,7 +966,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1057,7 +1024,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1094,7 +1061,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1141,7 +1108,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1190,6 +1157,16 @@ var _ = Describe("Node Controller", func() {
 					NodeSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"env": "requeue-test"}},
 					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
 				},
+				// Seed a stale failure so the successful reconcile must clear it,
+				// forcing the (intercepted, failing) status patch to run.
+				Status: nodereadinessiov1alpha1.NodeReadinessRuleStatus{
+					FailedNodes: []nodereadinessiov1alpha1.NodeFailure{{
+						NodeName:           "requeue-test-node",
+						Reason:             "EvaluationError",
+						Message:            "stale",
+						LastEvaluationTime: metav1.Now(),
+					}},
+				},
 			}
 
 			fc := fakeclient.NewClientBuilder().
@@ -1207,7 +1184,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 			controller.updateRuleCache(ctx, rule)
@@ -1279,7 +1256,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     map[string]*nodereadinessiov1alpha1.NodeReadinessRule{rule.Name: rule},
+				Snapshot:      storeWith(rule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1344,7 +1321,7 @@ var _ = Describe("Node Controller", func() {
 				Client:        fc,
 				Scheme:        testScheme,
 				clientset:     fake.NewSimpleClientset(),
-				ruleCache:     map[string]*nodereadinessiov1alpha1.NodeReadinessRule{rule.Name: rule},
+				Snapshot:      storeWith(rule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 
@@ -1359,6 +1336,76 @@ var _ = Describe("Node Controller", func() {
 			Expect(fc.Get(ctx, client.ObjectKey{Name: rule.Name}, latestRule)).To(Succeed())
 			Expect(latestRule.Status.FailedNodes).To(BeEmpty(),
 				"FailedNodes must be cleared in the persisted rule status")
+		})
+
+		It("should cap FailedNodes at 100 and report the true total via failedCount/failedTruncated", func() {
+			// A node whose taint write keeps failing when the rule already has the
+			// maximum sample of failures must not push the status past MaxItems=100
+			// (a larger Patch is rejected by the API server).
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "overflow-node"},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: "TestCondition", Status: corev1.ConditionFalse},
+					},
+				},
+			}
+			seeded := make([]nodereadinessiov1alpha1.NodeFailure, 0, maxFailedNodesInStatus)
+			for i := 0; i < maxFailedNodesInStatus; i++ {
+				seeded = append(seeded, nodereadinessiov1alpha1.NodeFailure{
+					NodeName: fmt.Sprintf("stale-node-%03d", i),
+					Reason:   "EvaluationError",
+					Message:  "prior failure",
+				})
+			}
+			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "overflow-rule"},
+				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
+					NodeSelector: metav1.LabelSelector{},
+					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
+						{Type: "TestCondition", RequiredStatus: corev1.ConditionTrue},
+					},
+					Taint: corev1.Taint{
+						Key:    "readiness.k8s.io/overflow-test",
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
+				},
+				Status: nodereadinessiov1alpha1.NodeReadinessRuleStatus{FailedNodes: seeded},
+			}
+
+			fc := fakeclient.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(node, rule).
+				WithStatusSubresource(rule).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if _, ok := obj.(*corev1.Node); ok {
+							return fmt.Errorf("simulated taint patch failure")
+						}
+						return c.Patch(ctx, obj, patch, opts...)
+					},
+				}).
+				Build()
+
+			controller := &RuleReadinessController{
+				Client:        fc,
+				Scheme:        testScheme,
+				clientset:     fake.NewSimpleClientset(),
+				Snapshot:      storeWith(rule),
+				EventRecorder: events.NewFakeRecorder(10),
+			}
+
+			// The taint write fails, so evaluation errors and the node is recorded.
+			Expect(controller.processNodeAgainstAllRules(ctx, node)).To(HaveOccurred())
+
+			latestRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(fc.Get(ctx, client.ObjectKey{Name: rule.Name}, latestRule)).To(Succeed())
+			Expect(latestRule.Status.FailedNodes).To(HaveLen(maxFailedNodesInStatus),
+				"FailedNodes must be capped at the schema MaxItems")
+			Expect(latestRule.Status.FailedTruncated).To(BeTrue())
+			Expect(latestRule.Status.FailedCount).To(Equal(int32(maxFailedNodesInStatus + 1)),
+				"failedCount must report the untruncated total")
 		})
 	})
 })

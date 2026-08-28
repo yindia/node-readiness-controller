@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	readinessv1alpha1 "sigs.k8s.io/node-readiness-controller/api/v1alpha1"
+	"sigs.k8s.io/node-readiness-controller/internal/snapshot"
 )
 
 func TestBootstrapAnnotationKey(t *testing.T) {
@@ -126,11 +127,21 @@ func TestLabelsEqual(t *testing.T) {
 	}
 }
 
+// storeWith returns a snapshot store seeded with the given rules, for tests
+// that need applicable rules present without running a reconcile.
+func storeWith(rules ...*readinessv1alpha1.NodeReadinessRule) *snapshot.Store {
+	s := snapshot.NewStore()
+	for _, r := range rules {
+		s.Upsert(r)
+	}
+	return s
+}
+
 func TestGetApplicableRulesForNode_DeepCopy(t *testing.T) {
 	g := NewWithT(t)
 
 	c := &RuleReadinessController{
-		ruleCache: make(map[string]*readinessv1alpha1.NodeReadinessRule),
+		Snapshot: snapshot.NewStore(),
 	}
 
 	rule := &readinessv1alpha1.NodeReadinessRule{
@@ -141,7 +152,7 @@ func TestGetApplicableRulesForNode_DeepCopy(t *testing.T) {
 			},
 		},
 		Status: readinessv1alpha1.NodeReadinessRuleStatus{
-			AppliedNodes: []string{"node-1"},
+			HeldNodes: []string{"node-1"},
 		},
 	}
 
@@ -159,12 +170,10 @@ func TestGetApplicableRulesForNode_DeepCopy(t *testing.T) {
 	g.Expect(rules).To(HaveLen(1))
 
 	// Mutate the returned rule's status
-	rules[0].Status.AppliedNodes = append(rules[0].Status.AppliedNodes, "node-2")
+	rules[0].Status.HeldNodes = append(rules[0].Status.HeldNodes, "node-2")
 
-	// Ensure the cached rule was isolated and not mutated
-	c.ruleCacheMutex.RLock()
-	cachedRule := c.ruleCache["rule-1"]
-	c.ruleCacheMutex.RUnlock()
-
-	g.Expect(cachedRule.Status.AppliedNodes).To(Equal([]string{"node-1"}))
+	// Ensure the snapshot entry was isolated and not mutated
+	cached, ok := c.Snapshot.Get("rule-1")
+	g.Expect(ok).To(BeTrue())
+	g.Expect(cached.Rule.Status.HeldNodes).To(Equal([]string{"node-1"}))
 }

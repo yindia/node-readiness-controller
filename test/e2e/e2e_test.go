@@ -851,7 +851,7 @@ spec:
 			exec.Command("kubectl", "delete", "nodereadinessrule", "missing-condition-rule").Run()
 		})
 
-		It("should clean up managed taints when the rule is deleted (finalizer behavior)", func() {
+		It("should clean up managed taints when the rule is deleted (barrier finalizer + GC)", func() {
 			nodeName := "finalizer-test-node"
 
 			By("creating a test node with condition unsatisfied")
@@ -910,7 +910,11 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("verifying taint is removed by finalizer cleanup")
+			// Under the single-writer model the taint is removed by the Node
+			// reconciler's GC once the rule is excluded from the snapshot; the
+			// finalizer is a drain barrier that keeps the rule Terminating until
+			// the taint is actually gone.
+			By("verifying taint is removed and the rule finalizes")
 			Eventually(func() bool {
 				cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
 				output, err := utils.Run(cmd)
@@ -920,8 +924,275 @@ spec:
 				return !strings.Contains(output, "readiness.k8s.io/FinalizerTest")
 			}, 30*time.Second, 2*time.Second).Should(BeTrue())
 
+			By("verifying the rule object is fully deleted (barrier released the finalizer)")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "nodereadinessrule", "finalizer-test-rule")
+				_, err := utils.Run(cmd)
+				return err != nil // NotFound once the finalizer is released
+			}, 30*time.Second, 2*time.Second).Should(BeTrue())
+
 			By("cleaning up test resources")
 			exec.Command("kubectl", "delete", "node", nodeName).Run()
+		})
+
+		It("should sweep the taint when a node stops matching the rule selector", func() {
+			nodeName := "selector-narrow-node"
+
+			By("creating a node that matches the rule with an unsatisfied condition")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`
+apiVersion: v1
+kind: Node
+metadata:
+  name: %s
+  labels:
+    e2e-test: "narrow"
+status:
+  conditions:
+    - type: NarrowReady
+      status: "False"
+      lastHeartbeatTime: %s
+      lastTransitionTime: %s
+`, nodeName, time.Now().Format(time.RFC3339), time.Now().Format(time.RFC3339)))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { exec.Command("kubectl", "delete", "node", nodeName).Run() })
+
+			By("applying a rule selecting e2e-test=narrow")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(`
+apiVersion: readiness.node.x-k8s.io/v1alpha1
+kind: NodeReadinessRule
+metadata:
+  name: narrow-rule
+spec:
+  conditions:
+    - type: NarrowReady
+      requiredStatus: "True"
+  taint:
+    key: readiness.k8s.io/NarrowReady
+    effect: NoSchedule
+  enforcementMode: "continuous"
+  nodeSelector:
+    matchLabels:
+      e2e-test: "narrow"
+`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { exec.Command("kubectl", "delete", "nodereadinessrule", "narrow-rule").Run() })
+
+			By("verifying the taint is applied")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
+				output, _ := utils.Run(cmd)
+				return strings.Contains(output, "readiness.k8s.io/NarrowReady")
+			}, 30*time.Second, 2*time.Second).Should(BeTrue())
+
+			By("relabeling the node so it no longer matches the selector")
+			cmd = exec.Command("kubectl", "label", "node", nodeName, "e2e-test=other", "--overwrite")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying GC sweeps the now-orphaned taint")
+			Eventually(func() bool {
+				cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
+				output, _ := utils.Run(cmd)
+				return !strings.Contains(output, "readiness.k8s.io/NarrowReady")
+			}, 30*time.Second, 2*time.Second).Should(BeTrue())
+		})
+
+		It("should not touch a foreign taint under the readiness prefix it did not apply", func() {
+			nodeName := "foreign-taint-node"
+			foreignTaint := "readiness.k8s.io/foreign"
+
+			By("creating a node carrying a foreign readiness-prefixed taint (not applied by the controller)")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`
+apiVersion: v1
+kind: Node
+metadata:
+  name: %s
+  labels:
+    e2e-test: "foreign"
+spec:
+  taints:
+    - key: %s
+      effect: NoSchedule
+status:
+  conditions:
+    - type: ForeignReady
+      status: "True"
+      lastHeartbeatTime: %s
+      lastTransitionTime: %s
+`, nodeName, foreignTaint, time.Now().Format(time.RFC3339), time.Now().Format(time.RFC3339)))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { exec.Command("kubectl", "delete", "node", nodeName).Run() })
+
+			By("applying a rule that manages a DIFFERENT taint key on the same node")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(`
+apiVersion: readiness.node.x-k8s.io/v1alpha1
+kind: NodeReadinessRule
+metadata:
+  name: foreign-rule
+spec:
+  conditions:
+    - type: ForeignReady
+      requiredStatus: "True"
+  taint:
+    key: readiness.k8s.io/managed
+    effect: NoSchedule
+  enforcementMode: "continuous"
+  nodeSelector:
+    matchLabels:
+      e2e-test: "foreign"
+`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { exec.Command("kubectl", "delete", "nodereadinessrule", "foreign-rule").Run() })
+
+			By("verifying the foreign taint is preserved across reconciles (ledger-based GC, not prefix-based)")
+			Consistently(func() bool {
+				cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.spec.taints}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return false
+				}
+				return strings.Contains(output, foreignTaint)
+			}, 15*time.Second, 3*time.Second).Should(BeTrue(), "foreign taint must never be garbage-collected")
+		})
+
+		It("should publish aggregate held counts in rule status", func() {
+			nodeName := "aggregate-status-node"
+
+			By("creating a node with an unsatisfied condition")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`
+apiVersion: v1
+kind: Node
+metadata:
+  name: %s
+  labels:
+    e2e-test: "aggregate"
+status:
+  conditions:
+    - type: AggReady
+      status: "False"
+      lastHeartbeatTime: %s
+      lastTransitionTime: %s
+`, nodeName, time.Now().Format(time.RFC3339), time.Now().Format(time.RFC3339)))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { exec.Command("kubectl", "delete", "node", nodeName).Run() })
+
+			By("applying a rule that will hold the node")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(`
+apiVersion: readiness.node.x-k8s.io/v1alpha1
+kind: NodeReadinessRule
+metadata:
+  name: aggregate-rule
+spec:
+  conditions:
+    - type: AggReady
+      requiredStatus: "True"
+  taint:
+    key: readiness.k8s.io/AggReady
+    effect: NoSchedule
+  enforcementMode: "continuous"
+  nodeSelector:
+    matchLabels:
+      e2e-test: "aggregate"
+`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { exec.Command("kubectl", "delete", "nodereadinessrule", "aggregate-rule").Run() })
+
+			By("verifying status.heldCount and status.heldNodes reflect the held node")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "nodereadinessrule", "aggregate-rule", "-o", "jsonpath={.status.heldCount}")
+				output, _ := utils.Run(cmd)
+				return strings.TrimSpace(output)
+			}, 30*time.Second, 2*time.Second).Should(Equal("1"))
+
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "nodereadinessrule", "aggregate-rule", "-o", "jsonpath={.status.heldNodes}")
+				output, _ := utils.Run(cmd)
+				return output
+			}, 30*time.Second, 2*time.Second).Should(ContainSubstring(nodeName))
+		})
+
+		It("should garbage-collect bootstrap-completion annotations of a deleted rule", func() {
+			nodeName := "bootstrap-gc-node"
+
+			By("creating a node whose condition is already satisfied")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`
+apiVersion: v1
+kind: Node
+metadata:
+  name: %s
+  labels:
+    e2e-test: "bootstrap-gc"
+status:
+  conditions:
+    - type: BootstrapGCReady
+      status: "True"
+      lastHeartbeatTime: %s
+      lastTransitionTime: %s
+`, nodeName, time.Now().Format(time.RFC3339), time.Now().Format(time.RFC3339)))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { exec.Command("kubectl", "delete", "node", nodeName).Run() })
+
+			By("applying a bootstrap-only rule so the node records a completion annotation")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(`
+apiVersion: readiness.node.x-k8s.io/v1alpha1
+kind: NodeReadinessRule
+metadata:
+  name: bootstrap-gc-rule
+spec:
+  conditions:
+    - type: BootstrapGCReady
+      requiredStatus: "True"
+  taint:
+    key: readiness.k8s.io/BootstrapGCReady
+    effect: NoSchedule
+  enforcementMode: "bootstrap-only"
+  nodeSelector:
+    matchLabels:
+      e2e-test: "bootstrap-gc"
+`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("getting the rule UID and waiting for the bootstrap-completion annotation")
+			var ruleUID string
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "nodereadinessrule", "bootstrap-gc-rule", "-o", "jsonpath={.metadata.uid}")
+				uid, _ := utils.Run(cmd)
+				ruleUID = strings.TrimSpace(uid)
+				return ruleUID
+			}, 15*time.Second, 1*time.Second).Should(Not(BeEmpty()))
+
+			annotation := func() string {
+				cmd := exec.Command("kubectl", "get", "node", nodeName, "-o", "jsonpath={.metadata.annotations}")
+				output, _ := utils.Run(cmd)
+				return output
+			}
+			Eventually(annotation, 30*time.Second, 2*time.Second).Should(
+				ContainSubstring(fmt.Sprintf("readiness.k8s.io/bootstrap-completed-%s", ruleUID)))
+
+			By("deleting the rule")
+			cmd = exec.Command("kubectl", "delete", "nodereadinessrule", "bootstrap-gc-rule")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the orphaned bootstrap-completion annotation is swept")
+			Eventually(annotation, 60*time.Second, 3*time.Second).ShouldNot(
+				ContainSubstring(fmt.Sprintf("bootstrap-completed-%s", ruleUID)))
 		})
 	})
 })

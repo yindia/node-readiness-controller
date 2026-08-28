@@ -273,16 +273,13 @@ spec:
             description: status defines the observed state of NodeReadinessRule
             minProperties: 1
             properties:
-              appliedNodes:
+              bootstrappingCount:
                 description: |-
-                  appliedNodes lists the names of Nodes where the taint has been successfully managed.
-                  This provides a quick reference to the scope of impact for this rule.
-                items:
-                  maxLength: 253
-                  type: string
-                maxItems: 5000
-                type: array
-                x-kubernetes-list-type: set
+                  bootstrappingCount is the number of matching Nodes still bootstrapping
+                  under a bootstrap-only rule (taint present, completion not yet recorded).
+                format: int32
+                minimum: 0
+                type: integer
               dryRunResults:
                 description: |-
                   dryRunResults captures the outcome of the rule evaluation when DryRun is enabled.
@@ -326,10 +323,19 @@ spec:
                 required:
                 - summary
                 type: object
+              failedCount:
+                description: |-
+                  failedCount is the number of matching Nodes whose evaluation errored, as
+                  observed by the node reconciler. The failedNodes list is bounded to a
+                  sample; failedTruncated is true when there are more failures than listed.
+                format: int32
+                minimum: 0
+                type: integer
               failedNodes:
                 description: |-
                   failedNodes lists the Nodes where the rule evaluation encountered an error.
-                  This is used for troubleshooting configuration issues, such as invalid selectors during node lookup.
+                  This is used for troubleshooting configuration issues. It is bounded; the
+                  untruncated total is reported by failedCount.
                 items:
                   description: NodeFailure provides diagnostic details for Nodes that
                     could not be successfully evaluated by the rule.
@@ -365,107 +371,54 @@ spec:
                   - lastEvaluationTime
                   - nodeName
                   type: object
-                maxItems: 5000
+                maxItems: 100
                 type: array
                 x-kubernetes-list-map-keys:
                 - nodeName
                 x-kubernetes-list-type: map
-              nodeEvaluations:
+              failedTruncated:
                 description: |-
-                  nodeEvaluations provides detailed insight into the rule's assessment for individual Nodes.
-                  This is primarily used for auditing and debugging why specific Nodes were or
-                  were not targeted by the rule.
+                  failedTruncated is true when failedCount exceeds the number of entries
+                  reported in failedNodes.
+                type: boolean
+              heldCount:
+                description: |-
+                  heldCount is the number of matching Nodes that currently carry the rule's
+                  taint (not yet ready). Aggregate counters are O(1) in object size, unlike
+                  the per-node arrays below, and are safe at any cluster scale.
+                format: int32
+                minimum: 0
+                type: integer
+              heldNodes:
+                description: |-
+                  heldNodes is a bounded sample of Nodes currently holding the taint, for
+                  quick "what is stuck right now" triage. It is intentionally capped and NOT
+                  sized to the cluster; heldTruncated reports whether entries were omitted.
+                  Full per-node detail lives on the Node and (when enabled) in
+                  NodeReadinessEvaluation objects, not in this cluster-sized array.
                 items:
-                  description: NodeEvaluation provides a detailed audit of a single
-                    Node's compliance with the rule.
-                  properties:
-                    conditionResults:
-                      description: |-
-                        conditionResults provides a detailed breakdown of each condition evaluation
-                        for this Node. This allows for granular auditing of which specific
-                        criteria passed or failed during the rule assessment.
-                      items:
-                        description: |-
-                          ConditionEvaluationResult provides a detailed report of the comparison between
-                          the Node's observed condition and the rule's requirement.
-                        properties:
-                          currentStatus:
-                            description: currentStatus is the actual status value
-                              observed on the Node, one of True, False, Unknown.
-                            enum:
-                            - "True"
-                            - "False"
-                            - Unknown
-                            type: string
-                          defaultStatus:
-                            description: |-
-                              defaultStatus is the status a condition is evaluated to if the condition
-                              is not found in a node. Reflects the defaultStatus configured in the rule
-                              spec.
-                            enum:
-                            - "True"
-                            - "False"
-                            - Unknown
-                            type: string
-                          requiredStatus:
-                            description: requiredStatus is the status value defined
-                              in the rule that must be matched, one of True, False,
-                              Unknown.
-                            enum:
-                            - "True"
-                            - "False"
-                            - Unknown
-                            type: string
-                          type:
-                            description: type corresponds to the Node condition type
-                              being evaluated.
-                            maxLength: 316
-                            minLength: 1
-                            type: string
-                        required:
-                        - currentStatus
-                        - requiredStatus
-                        - type
-                        type: object
-                      maxItems: 5000
-                      type: array
-                      x-kubernetes-list-map-keys:
-                      - type
-                      x-kubernetes-list-type: map
-                    lastEvaluationTime:
-                      description: lastEvaluationTime is the timestamp when the controller
-                        last assessed this Node.
-                      format: date-time
-                      type: string
-                    nodeName:
-                      description: nodeName is the name of the evaluated Node.
-                      maxLength: 253
-                      minLength: 1
-                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
-                      type: string
-                    taintStatus:
-                      description: taintStatus represents the taint status on the
-                        Node, one of Present, Absent.
-                      enum:
-                      - Present
-                      - Absent
-                      type: string
-                  required:
-                  - conditionResults
-                  - lastEvaluationTime
-                  - nodeName
-                  - taintStatus
-                  type: object
-                maxItems: 5000
+                  maxLength: 253
+                  type: string
+                maxItems: 100
                 type: array
-                x-kubernetes-list-map-keys:
-                - nodeName
-                x-kubernetes-list-type: map
+                x-kubernetes-list-type: set
+              heldTruncated:
+                description: |-
+                  heldTruncated is true when heldCount exceeds the number of entries reported
+                  in heldNodes.
+                type: boolean
               observedGeneration:
                 description: observedGeneration reflects the generation of the most
                   recently observed NodeReadinessRule by the controller.
                 format: int64
                 minimum: 1
+                type: integer
+              releasedCount:
+                description: |-
+                  releasedCount is the number of matching Nodes that have satisfied the rule
+                  and no longer carry the taint.
+                format: int32
+                minimum: 0
                 type: integer
             type: object
         required:

@@ -37,6 +37,7 @@ import (
 
 	nodereadinessiov1alpha1 "sigs.k8s.io/node-readiness-controller/api/v1alpha1"
 	"sigs.k8s.io/node-readiness-controller/internal/metrics"
+	"sigs.k8s.io/node-readiness-controller/internal/snapshot"
 )
 
 const (
@@ -89,7 +90,7 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			Client:        k8sClient,
 			Scheme:        scheme,
 			clientset:     fakeClientset,
-			ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+			Snapshot:      snapshot.NewStore(),
 			EventRecorder: events.NewFakeRecorder(10),
 		}
 
@@ -181,12 +182,10 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				return err
 			}).Should(Succeed())
 
-			// Verify rule is in cache
-			readinessController.ruleCacheMutex.RLock()
-			cachedRule, exists := readinessController.ruleCache["test-rule"]
-			readinessController.ruleCacheMutex.RUnlock()
+			// Verify rule is in the snapshot
+			cachedRule, exists := readinessController.Snapshot.Get("test-rule")
 			Expect(exists).To(BeTrue())
-			Expect(cachedRule.Spec.Taint.Key).To(Equal("readiness.k8s.io/test-taint"))
+			Expect(cachedRule.Rule.Spec.Taint.Key).To(Equal("readiness.k8s.io/test-taint"))
 
 			// Cleanup
 			Expect(k8sClient.Delete(ctx, rule)).To(Succeed())
@@ -233,9 +232,7 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				readinessController.ruleCacheMutex.RLock()
-				_, exists := readinessController.ruleCache["test-rule-delete"]
-				readinessController.ruleCacheMutex.RUnlock()
+				_, exists := readinessController.Snapshot.Get("test-rule-delete")
 				return !exists
 			}).Should(BeTrue())
 		})
@@ -283,9 +280,15 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, rule) }()
 
-			// Trigger reconciliation manually to simulate CREATE event handling
+			// Trigger reconciliation manually to simulate CREATE event handling.
+			// The rule reconciler now only publishes status; the Node reconciler is
+			// the sole taint writer, mirroring the manager's rule-watch -> node enqueue.
 			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: "immediate-test-rule"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "immediate-test-node"},
 			})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -304,15 +307,13 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				return false
 			}, time.Second*5).Should(BeTrue())
 
-			// Verify rule status includes the node
-			Eventually(func() []string {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: "immediate-test-rule"}, updatedRule)
-				if err != nil {
-					return nil
-				}
-				return updatedRule.Status.AppliedNodes
-			}, time.Second*5).Should(ContainElement("immediate-test-node"))
+			// Recompute rule status now the taint is applied, and verify the held node.
+			_, err = ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "immediate-test-rule"}})
+			Expect(err).NotTo(HaveOccurred())
+			updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "immediate-test-rule"}, updatedRule)).To(Succeed())
+			Expect(updatedRule.Status.HeldNodes).To(ContainElement("immediate-test-node"))
+			Expect(updatedRule.Status.HeldCount).To(BeNumerically(">", 0))
 		})
 
 		It("should handle dry run mode", func() {
@@ -924,6 +925,10 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 					NamespacedName: types.NamespacedName{Name: ruleName},
 				})
 				Expect(err).NotTo(HaveOccurred())
+				_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: nodeName},
+				})
+				Expect(err).NotTo(HaveOccurred())
 
 				// The pre-existing taint should be removed because the absent condition
 				// is satisfied via defaultStatus:False.
@@ -939,30 +944,8 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 					}
 					return false
 				}, time.Second*5).Should(BeFalse(), "taint should be removed when absent condition satisfies via defaultStatus")
-
-				// Validate that CurrentStatus is Unknown (observed status), RequiredStatus is False, and DefaultStatus is False.
-				Eventually(func() nodereadinessiov1alpha1.ConditionEvaluationResult {
-					updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-					if err := k8sClient.Get(ctx, types.NamespacedName{Name: ruleName}, updatedRule); err != nil {
-						return nodereadinessiov1alpha1.ConditionEvaluationResult{}
-					}
-					for _, ne := range updatedRule.Status.NodeEvaluations {
-						if ne.NodeName == nodeName && len(ne.ConditionResults) > 0 {
-							return ne.ConditionResults[0]
-						}
-					}
-					return nodereadinessiov1alpha1.ConditionEvaluationResult{}
-				}, time.Second*5).Should(SatisfyAll(
-					WithTransform(func(r nodereadinessiov1alpha1.ConditionEvaluationResult) corev1.ConditionStatus {
-						return r.CurrentStatus
-					}, Equal(corev1.ConditionUnknown)),
-					WithTransform(func(r nodereadinessiov1alpha1.ConditionEvaluationResult) corev1.ConditionStatus {
-						return r.RequiredStatus
-					}, Equal(corev1.ConditionFalse)),
-					WithTransform(func(r nodereadinessiov1alpha1.ConditionEvaluationResult) corev1.ConditionStatus {
-						return r.DefaultStatus
-					}, Equal(corev1.ConditionFalse)),
-				))
+				// Per-condition detail (Unknown/False/False) is covered by the
+				// evaluation package's unit tests; it is no longer persisted to status.
 			})
 	})
 
@@ -1467,8 +1450,11 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			// Create the rule
 			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
 
-			// Reconcile the rule
+			// Reconcile the rule (publishes status + snapshot), then the node
+			// (sole taint writer), mirroring the manager's rule-watch -> node enqueue.
 			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "db-rule"}})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "node1"}})
 			Expect(err).NotTo(HaveOccurred())
 
 			// Verify that the taint has been added to the node
@@ -1485,12 +1471,12 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				return false
 			}, time.Second*5).Should(BeTrue())
 
-			// Verify the status of the rule
-			Eventually(func() []string {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "db-rule"}, updatedRule)
-				return updatedRule.Status.AppliedNodes
-			}, time.Second*5).Should(ContainElement("node1"))
+			// Recompute rule status now the taint is applied, and verify the held node.
+			_, err = ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "db-rule"}})
+			Expect(err).NotTo(HaveOccurred())
+			updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "db-rule"}, updatedRule)).To(Succeed())
+			Expect(updatedRule.Status.HeldNodes).To(ContainElement("node1"))
 		})
 	})
 
@@ -1604,20 +1590,26 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			// Add the rule to the cache
 			readinessController.updateRuleCache(ctx, rule)
 
-			// Manually trigger rule reconciliation to simulate watch behavior
+			// Manually trigger rule reconciliation to simulate watch behavior, then
+			// the node reconcile (sole taint writer) for the newly added node.
 			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: "new-node-rule"},
 			})
 			Expect(err).NotTo(HaveOccurred())
+			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "new-node"},
+			})
+			Expect(err).NotTo(HaveOccurred())
 
-			// Verify that the rule's status is updated to include the new node
+			// Recompute rule status now the taint is applied, and verify the held node.
+			_, err = ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "new-node-rule"}})
+			Expect(err).NotTo(HaveOccurred())
 			Eventually(func() []string {
 				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: "new-node-rule"}, updatedRule)
-				if err != nil {
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "new-node-rule"}, updatedRule); err != nil {
 					return nil
 				}
-				return updatedRule.Status.AppliedNodes
+				return updatedRule.Status.HeldNodes
 			}, time.Second*5, time.Millisecond*250).Should(ContainElement("new-node"))
 
 			// Verify that the new node gets tainted
@@ -1692,6 +1684,11 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				return updatedRule.Finalizers
 			}, time.Second*5).Should(ContainElement("readiness.node.x-k8s.io/cleanup-taints"))
 
+			// Node reconcile adopts the pre-existing taint into the ownership ledger
+			// (rule matches, condition unmet -> taint stays and is now owned).
+			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "cleanup-test-node"}})
+			Expect(err).NotTo(HaveOccurred())
+
 			// Verify node still has taint
 			updatedNode := &corev1.Node{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cleanup-test-node"}, updatedNode)).To(Succeed())
@@ -1707,7 +1704,13 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			// Delete the rule
 			Expect(k8sClient.Delete(ctx, rule)).To(Succeed())
 
-			// Trigger reconciliation to process deletion
+			// Barrier flow: rule reconcile excludes the rule from the snapshot and
+			// stays Terminating; the node reconcile GC-sweeps the now-orphan taint;
+			// the next rule reconcile sees the ledger drained and removes the finalizer.
+			_, err = ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "cleanup-rule"}})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "cleanup-test-node"}})
+			Expect(err).NotTo(HaveOccurred())
 			_, err = ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "cleanup-rule"}})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -1783,58 +1786,32 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			_ = k8sClient.Delete(ctx, node2)
 		})
 
-		It("should remove the node from the rule's status", func() {
-			// Initial reconcile to populate status
+		It("should drop a deleted node from the aggregate counts", func() {
+			matched := func() int32 {
+				r := &nodereadinessiov1alpha1.NodeReadinessRule{}
+				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "delete-node-rule"}, r)
+				return r.Status.HeldCount + r.Status.ReleasedCount + r.Status.BootstrappingCount
+			}
+
 			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "delete-node-rule"}})
 			Expect(err).NotTo(HaveOccurred())
+			Eventually(matched, time.Second*5).Should(Equal(int32(2)))
 
-			Eventually(func() int {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "delete-node-rule"}, updatedRule)
-				return len(updatedRule.Status.NodeEvaluations)
-			}, time.Second*5).Should(Equal(2))
-
-			// Delete node1
 			Expect(k8sClient.Delete(ctx, node1)).To(Succeed())
-
-			// Reconcile again to trigger cleanup
 			_, err = ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "delete-node-rule"}})
 			Expect(err).NotTo(HaveOccurred())
-
-			// Verify node1 is removed from status
-			Eventually(func() bool {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "delete-node-rule"}, updatedRule)
-				for _, eval := range updatedRule.Status.NodeEvaluations {
-					if eval.NodeName == "node1" {
-						return false
-					}
-				}
-				return true
-			}, time.Second*5).Should(BeTrue())
-
-			// Verify node2 is still in status
-			Eventually(func() bool {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "delete-node-rule"}, updatedRule)
-				for _, eval := range updatedRule.Status.NodeEvaluations {
-					if eval.NodeName == "node2" {
-						return true
-					}
-				}
-				return false
-			}, time.Second*5).Should(BeTrue())
+			Eventually(matched, time.Second*5).Should(Equal(int32(1)))
 		})
 
 		It("removes failedNodes entries for deleted nodes", func() {
 			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "delete-node-rule"}})
 			Expect(err).NotTo(HaveOccurred())
 
-			Eventually(func() int {
+			Eventually(func() int32 {
 				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
 				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "delete-node-rule"}, updatedRule)
-				return len(updatedRule.Status.NodeEvaluations)
-			}, time.Second*5).Should(Equal(2))
+				return updatedRule.Status.HeldCount + updatedRule.Status.ReleasedCount + updatedRule.Status.BootstrappingCount
+			}, time.Second*5).Should(Equal(int32(2)))
 
 			seededRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "delete-node-rule"}, seededRule)).To(Succeed())
@@ -2340,53 +2317,19 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 			}, time.Second*10).Should(BeTrue())
 		})
 
-		It("should list only nodes matching the selector in AppliedNodes", func() {
+		It("should count only nodes matching the selector", func() {
 			By("Running reconciliation")
 			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: "applied-nodes-rule"},
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying AppliedNodes contains only matching nodes")
-			Eventually(func() []string {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "applied-nodes-rule"}, updatedRule)
-				return updatedRule.Status.AppliedNodes
-			}, time.Second*5).Should(And(
-				ContainElement("applied-node-1"),
-				ContainElement("applied-node-2"),
-				Not(ContainElement("applied-node-3")),
-			), "AppliedNodes should only contain nodes matching selector")
-		})
-
-		It("should have matching NodeEvaluations for all AppliedNodes", func() {
-			By("Running reconciliation")
-			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "applied-nodes-rule"},
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Verifying NodeEvaluations exist for all AppliedNodes")
-			Eventually(func() bool {
-				updatedRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "applied-nodes-rule"}, updatedRule); err != nil {
-					return false
-				}
-
-				for _, appliedNode := range updatedRule.Status.AppliedNodes {
-					found := false
-					for _, eval := range updatedRule.Status.NodeEvaluations {
-						if eval.NodeName == appliedNode {
-							found = true
-							break
-						}
-					}
-					if !found {
-						return false
-					}
-				}
-				return len(updatedRule.Status.AppliedNodes) > 0
-			}, time.Second*5).Should(BeTrue(), "All AppliedNodes should have corresponding NodeEvaluations")
+			By("Verifying the aggregate counts include only the two matching nodes")
+			Eventually(func() int32 {
+				r := &nodereadinessiov1alpha1.NodeReadinessRule{}
+				_ = k8sClient.Get(ctx, types.NamespacedName{Name: "applied-nodes-rule"}, r)
+				return r.Status.HeldCount + r.Status.ReleasedCount + r.Status.BootstrappingCount
+			}, time.Second*5).Should(Equal(int32(2)), "only selector-matching nodes should be counted (node-3 excluded)")
 		})
 	})
 
@@ -2418,25 +2361,34 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				},
 			}
 
+			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, rule) }()
+
 			errClient := &errorInjectingClient{
 				Client:        k8sClient,
 				failNodeNames: map[string]bool{"fail-path-node": true},
 			}
+			// Single-writer: the Node reconciler applies taints and records failures.
 			failController := &RuleReadinessController{
 				Client:        errClient,
 				Scheme:        scheme,
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      storeWith(rule),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
+			failNodeReconciler := &NodeReconciler{Client: errClient, Scheme: scheme, Controller: failController}
 
-			nodeList := &corev1.NodeList{Items: []corev1.Node{*failNode}}
-			Expect(failController.processAllNodesForRule(ctx, rule, nodeList)).To(Succeed())
+			_, err := failNodeReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "fail-path-node"},
+			})
+			Expect(err).To(HaveOccurred()) // taint apply failed for this node
 
-			Expect(rule.Status.AppliedNodes).NotTo(ContainElement("fail-path-node"))
+			persisted := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rule.Name}, persisted)).To(Succeed())
+			Expect(persisted.Status.HeldNodes).NotTo(ContainElement("fail-path-node"))
 
-			failedNames := make([]string, 0, len(rule.Status.FailedNodes))
-			for _, f := range rule.Status.FailedNodes {
+			failedNames := make([]string, 0, len(persisted.Status.FailedNodes))
+			for _, f := range persisted.Status.FailedNodes {
 				failedNames = append(failedNames, f.NodeName)
 			}
 			Expect(failedNames).To(ContainElement("fail-path-node"))
@@ -2479,21 +2431,33 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 				},
 			}
 
-			successController := &RuleReadinessController{
-				Client:        k8sClient,
-				Scheme:        scheme,
-				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
-				EventRecorder: events.NewFakeRecorder(10),
-			}
+			Expect(k8sClient.Create(ctx, rule)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, rule) }()
+			// Persist the stale failure the reconcile is expected to clear.
+			stale := rule.DeepCopy()
+			stale.Status.FailedNodes = []nodereadinessiov1alpha1.NodeFailure{{
+				NodeName: "stale-recovery-node", Reason: "EvaluationError",
+				Message: "stale from previous reconcile", LastEvaluationTime: metav1.Now(),
+			}}
+			Expect(k8sClient.Status().Update(ctx, stale)).To(Succeed())
 
-			nodeList := &corev1.NodeList{Items: []corev1.Node{*successNode}}
-			Expect(successController.processAllNodesForRule(ctx, rule, nodeList)).To(Succeed())
+			// First rule reconcile adds the finalizer and requeues; the second
+			// publishes the snapshot and computes AppliedNodes. The node reconcile
+			// then clears the stale failure.
+			_, err := ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: rule.Name}})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = ruleReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: rule.Name}})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = nodeReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "stale-recovery-node"}})
+			Expect(err).NotTo(HaveOccurred())
 
-			Expect(rule.Status.AppliedNodes).To(ContainElement("stale-recovery-node"))
+			persisted := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rule.Name}, persisted)).To(Succeed())
+			// stale-recovery-node is Ready, so it is released (not held).
+			Expect(persisted.Status.ReleasedCount).To(BeNumerically(">", 0))
 
-			failedNames := make([]string, 0, len(rule.Status.FailedNodes))
-			for _, f := range rule.Status.FailedNodes {
+			failedNames := make([]string, 0, len(persisted.Status.FailedNodes))
+			for _, f := range persisted.Status.FailedNodes {
 				failedNames = append(failedNames, f.NodeName)
 			}
 			Expect(failedNames).NotTo(ContainElement("stale-recovery-node"))
@@ -2549,11 +2513,6 @@ var _ = Describe("NodeReadinessRule Controller", func() {
 
 			// Taint should have been removed because HardwareDriverReady=True satisfies anyOf
 			Expect(readinessController.hasTaintBySpec(anyOfNode, rule.Spec.Taint)).To(BeFalse())
-
-			// conditionResults in status should reflect actual observed values
-			eval := readinessController.getPreviousNodeEvaluation(rule, anyOfNode.Name)
-			Expect(eval).NotTo(BeNil())
-			Expect(eval.ConditionResults).To(HaveLen(2))
 		})
 
 		It("anyOf: adds taint when no conditions are satisfied", func() {

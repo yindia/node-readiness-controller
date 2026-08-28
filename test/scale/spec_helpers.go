@@ -216,7 +216,7 @@ func waitForNodeTaints(ctx context.Context, targetTaintedCount int) {
 		g.Expect(err).NotTo(HaveOccurred())
 		By(fmt.Sprintf("Progress: %d/%d nodes tainted", count, cfg.NodeCount))
 		return count
-	}).WithPolling(1 * time.Second).Should(Equal(targetTaintedCount), "Tainted node count did not reach expected target")
+	}).WithPolling(1*time.Second).Should(Equal(targetTaintedCount), "Tainted node count did not reach expected target")
 }
 
 func queryPrometheusInstant(ctx context.Context, query string, ts float64) (string, error) {

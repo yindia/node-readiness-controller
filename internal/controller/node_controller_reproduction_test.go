@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nodereadinessiov1alpha1 "sigs.k8s.io/node-readiness-controller/api/v1alpha1"
+	"sigs.k8s.io/node-readiness-controller/internal/snapshot"
 )
 
 var _ = Describe("Node Controller Reproduction", func() {
@@ -51,7 +52,7 @@ var _ = Describe("Node Controller Reproduction", func() {
 				Client:        k8sClient,
 				Scheme:        k8sClient.Scheme(),
 				clientset:     fakeClientset,
-				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				Snapshot:      snapshot.NewStore(),
 				EventRecorder: events.NewFakeRecorder(10),
 			}
 

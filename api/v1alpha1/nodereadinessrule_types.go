@@ -178,33 +178,69 @@ type NodeReadinessRuleStatus struct {
 	// +kubebuilder:validation:Minimum=1
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// appliedNodes lists the names of Nodes where the taint has been successfully managed.
-	// This provides a quick reference to the scope of impact for this rule.
+	// heldCount is the number of matching Nodes that currently carry the rule's
+	// taint (not yet ready). Aggregate counters are O(1) in object size, unlike
+	// the per-node arrays below, and are safe at any cluster scale.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	HeldCount int32 `json:"heldCount,omitempty"`
+
+	// releasedCount is the number of matching Nodes that have satisfied the rule
+	// and no longer carry the taint.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ReleasedCount int32 `json:"releasedCount,omitempty"`
+
+	// bootstrappingCount is the number of matching Nodes still bootstrapping
+	// under a bootstrap-only rule (taint present, completion not yet recorded).
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	BootstrappingCount int32 `json:"bootstrappingCount,omitempty"`
+
+	// failedCount is the number of matching Nodes whose evaluation errored, as
+	// observed by the node reconciler. The failedNodes list is bounded to a
+	// sample; failedTruncated is true when there are more failures than listed.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	FailedCount int32 `json:"failedCount,omitempty"`
+
+	// heldNodes is a bounded sample of Nodes currently holding the taint, for
+	// quick "what is stuck right now" triage. It is intentionally capped and NOT
+	// sized to the cluster; heldTruncated reports whether entries were omitted.
+	// Full per-node detail lives on the Node and (when enabled) in
+	// NodeReadinessEvaluation objects, not in this cluster-sized array.
 	//
 	// +optional
 	// +listType=set
-	// +kubebuilder:validation:MaxItems=5000
+	// +kubebuilder:validation:MaxItems=100
 	// +kubebuilder:validation:items:MaxLength=253
-	AppliedNodes []string `json:"appliedNodes,omitempty"`
+	HeldNodes []string `json:"heldNodes,omitempty"`
+
+	// heldTruncated is true when heldCount exceeds the number of entries reported
+	// in heldNodes.
+	//
+	// +optional
+	HeldTruncated bool `json:"heldTruncated,omitempty"`
 
 	// failedNodes lists the Nodes where the rule evaluation encountered an error.
-	// This is used for troubleshooting configuration issues, such as invalid selectors during node lookup.
+	// This is used for troubleshooting configuration issues. It is bounded; the
+	// untruncated total is reported by failedCount.
 	//
 	// +optional
 	// +listType=map
 	// +listMapKey=nodeName
-	// +kubebuilder:validation:MaxItems=5000
+	// +kubebuilder:validation:MaxItems=100
 	FailedNodes []NodeFailure `json:"failedNodes,omitempty"`
 
-	// nodeEvaluations provides detailed insight into the rule's assessment for individual Nodes.
-	// This is primarily used for auditing and debugging why specific Nodes were or
-	// were not targeted by the rule.
+	// failedTruncated is true when failedCount exceeds the number of entries
+	// reported in failedNodes.
 	//
 	// +optional
-	// +listType=map
-	// +listMapKey=nodeName
-	// +kubebuilder:validation:MaxItems=5000
-	NodeEvaluations []NodeEvaluation `json:"nodeEvaluations,omitempty"`
+	FailedTruncated bool `json:"failedTruncated,omitempty"`
 
 	// dryRunResults captures the outcome of the rule evaluation when DryRun is enabled.
 	// This field provides visibility into the actions the controller would have taken,

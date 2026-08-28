@@ -62,3 +62,40 @@ Enable verbose logging:
 kubectl patch deployment -n nrrcontroller-system nrrcontroller-controller-manager \
   -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","args":["--zap-log-level=debug"]}]}}}}'
 ```
+
+### Rule stuck in Terminating
+
+A `NodeReadinessRule` stays in `Terminating` until every taint it applied has
+been removed from the affected Nodes. This barrier is fail-closed: the
+finalizer (`readiness.node.x-k8s.io/cleanup-taints`) is never removed
+automatically while any Node still records the rule's taint in its ownership
+ledger (annotation `readiness.k8s.io/owned-taints`).
+
+If a rule sits in `Terminating`, the controller emits a Warning event once the
+wait passes a threshold:
+
+```sh
+kubectl describe nodereadinessrule <name>   # look for reason TaintDrainPending
+```
+
+The usual cause is a Node whose taint removal keeps failing. Find it:
+
+```sh
+# Nodes still holding the rule's taint key in their ledger
+kubectl get nodes -o json \
+  | jq -r --arg k '<taint-key>' '.items[]
+      | select((.metadata.annotations["readiness.k8s.io/owned-taints"] // "")
+      | contains($k)) | .metadata.name'
+
+# Look for TaintRemoveFailed events on those Nodes
+kubectl describe node <node>
+```
+
+Fix the underlying cause (API errors, a wedged Node object) and the drain
+completes on its own. Only as a last resort, and once you have confirmed the
+taints are actually gone, remove the finalizer by hand to force deletion:
+
+```sh
+kubectl patch nodereadinessrule <name> --type=json \
+  -p '[{"op":"remove","path":"/metadata/finalizers/0"}]'
+```

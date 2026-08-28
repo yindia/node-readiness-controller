@@ -97,6 +97,24 @@ var _ = Describe("Node Readiness Controller Scalability Test", func() {
 		By("Sleeping 10 seconds to settle metrics before gathering final report")
 		time.Sleep(10 * time.Second)
 
+		// Steady-State Phase: no condition, label, or rule changes occur. The
+		// single-writer design should do essentially no work at rest -- no
+		// per-node status fan-out (the old O(n^2) path) and no self-induced
+		// reconciles. The per-phase counter queries (taint_op_add/remove,
+		// workqueue_adds_node, workqueue_retries_node) over this window should be
+		// ~0. Kept shorter than the manager SyncPeriod so the resync backstop
+		// does not intentionally re-enqueue during the measurement.
+		By("Measuring steady-state write churn with no changes applied")
+		steadyStart := time.Now()
+		time.Sleep(30 * time.Second)
+		steadyEnd := time.Now()
+		phases = append(phases, phaseStats{
+			phase: "steady",
+			title: fmt.Sprintf("%d Nodes - Steady-State (no changes) Phase [Duration: %s]", nodeCount, steadyEnd.Sub(steadyStart).Round(time.Millisecond)),
+			start: steadyStart,
+			end:   steadyEnd,
+		})
+
 		collectAndRecordPhaseMetrics(ctx, phases)
 	})
 })

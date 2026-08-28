@@ -17,10 +17,13 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -28,13 +31,17 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/rest"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -43,6 +50,7 @@ import (
 	"sigs.k8s.io/node-readiness-controller/internal/controller"
 	"sigs.k8s.io/node-readiness-controller/internal/info"
 	"sigs.k8s.io/node-readiness-controller/internal/metrics"
+	"sigs.k8s.io/node-readiness-controller/internal/snapshot"
 	"sigs.k8s.io/node-readiness-controller/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
@@ -52,6 +60,8 @@ const (
 	defaultKubeAPIBurst             = -1
 	defaultNodeConcurrentReconciles = 1
 	defaultRuleConcurrentReconciles = 1
+	defaultNodeQueueQPS             = 50.0
+	defaultNodeQueueBurst           = 100
 )
 
 var (
@@ -71,6 +81,8 @@ var (
 	kubeAPIBurst             int
 	nodeConcurrentReconciles int
 	ruleConcurrentReconciles int
+	nodeQueueQPS             float64
+	nodeQueueBurst           int
 )
 
 func init() {
@@ -109,6 +121,11 @@ func main() {
 			"Raise on large clusters to reduce readiness-taint latency during node join/condition updates.")
 	flag.IntVar(&ruleConcurrentReconciles, "rule-concurrent-reconciles", defaultRuleConcurrentReconciles,
 		"Maximum number of NodeReadinessRule objects reconciled concurrently.")
+	flag.Float64Var(&nodeQueueQPS, "node-queue-qps", defaultNodeQueueQPS,
+		"Overall token-bucket rate (reconciles/sec) for the Node work queue, smoothing fan-out storms "+
+			"from broad rule changes. Set <= 0 to disable the bucket (per-item backoff only). Tune with the scale test.")
+	flag.IntVar(&nodeQueueBurst, "node-queue-burst", defaultNodeQueueBurst,
+		"Burst size for the Node work-queue token bucket (see --node-queue-qps).")
 
 	opts := zap.Options{
 		Development:     true,
@@ -136,9 +153,20 @@ func main() {
 	restConfig.QPS = float32(kubeAPIQPS)
 	restConfig.Burst = kubeAPIBurst
 
+	syncPeriod := 10 * time.Minute
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:                  scheme,
-		Metrics:                 metricsServerOptions,
+		Scheme:  scheme,
+		Metrics: metricsServerOptions,
+		Cache: cache.Options{
+			// Resync backstop: re-evaluate every node/rule periodically so any
+			// missed event (or a fail-closed GC that wrongly kept a taint) self-heals.
+			SyncPeriod: &syncPeriod,
+			ByObject: map[client.Object]cache.ByObject{
+				// Strip the largest, unused parts of cached Node objects to cut
+				// controller memory at 5000+ nodes.
+				&corev1.Node{}: {Transform: stripNode},
+			},
+		},
 		HealthProbeBindAddress:  probeAddr,
 		PprofBindAddress:        pprofAddr,
 		LeaderElection:          enableLeaderElection,
@@ -157,8 +185,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The single-writer taint model assumes exactly one active controller. Leader
+	// election guarantees that across replicas; without it, running more than one
+	// replica reintroduces the taint-write race.
+	if !enableLeaderElection {
+		setupLog.Info("WARNING: leader election is disabled; run only a single replica. " +
+			"Multiple active replicas without leader election will race on Node taints.")
+	}
+
+	// Shared, lock-free rule snapshot consumed by both reconcilers.
+	store := snapshot.NewStore()
+
 	// Create the main RuleReadinessController
-	readinessController := controller.NewRuleReadinessController(mgr, clientset, enableNodeStateMetrics)
+	readinessController := controller.NewRuleReadinessController(mgr, clientset, enableNodeStateMetrics, store)
 
 	// Register the scrape-time collector.
 	crmetrics.Registry.MustRegister(metrics.NewReadinessCollector(readinessController))
@@ -176,6 +215,8 @@ func main() {
 		Scheme:                  mgr.GetScheme(),
 		Controller:              readinessController,
 		MaxConcurrentReconciles: nodeConcurrentReconciles,
+		NodeQueueQPS:            nodeQueueQPS,
+		NodeQueueBurst:          nodeQueueBurst,
 	}
 
 	// Setup controllers with manager
@@ -186,6 +227,18 @@ func main() {
 	}
 	if err := nodeReconciler.SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Node")
+		os.Exit(1)
+	}
+
+	// Arm fail-closed GC only after the cache has synced and the first snapshot
+	// rebuild succeeds. Until then the snapshot is disarmed and GC removes nothing.
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		if !mgr.GetCache().WaitForCacheSync(ctx) {
+			return errors.New("cache did not sync before snapshot rebuild")
+		}
+		return readinessController.RebuildSnapshot(ctx)
+	})); err != nil {
+		setupLog.Error(err, "unable to add snapshot arm runnable")
 		os.Exit(1)
 	}
 
@@ -216,4 +269,18 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// stripNode is a cache transform that drops the largest, controller-irrelevant
+// parts of Node objects before they are cached, cutting steady-state memory at
+// large node counts. managedFields and status.images dominate Node object size
+// and are never read by this controller.
+func stripNode(obj interface{}) (interface{}, error) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return obj, nil
+	}
+	node.ManagedFields = nil
+	node.Status.Images = nil
+	return node, nil
 }

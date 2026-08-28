@@ -20,18 +20,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	readinessv1alpha1 "sigs.k8s.io/node-readiness-controller/api/v1alpha1"
 	"sigs.k8s.io/node-readiness-controller/internal/metrics"
@@ -43,6 +49,12 @@ type NodeReconciler struct {
 	Scheme                  *runtime.Scheme
 	Controller              *RuleReadinessController
 	MaxConcurrentReconciles int // caps how many nodes are reconciled concurrently
+
+	// NodeQueueQPS/NodeQueueBurst bound the overall node work-queue rate so a
+	// broad rule change cannot stampede the API server. When QPS <= 0 the overall
+	// token bucket is disabled and only per-item exponential backoff applies.
+	NodeQueueQPS   float64
+	NodeQueueBurst int
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -50,7 +62,13 @@ func (r *NodeReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager)
 	concurrency := max(r.MaxConcurrentReconciles, 1)
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("node").
-		WithOptions(controller.Options{MaxConcurrentReconciles: concurrency}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: concurrency,
+			// A broadly-selecting rule edit can enqueue the whole fleet at once.
+			// Cap the overall queue rate (token bucket) on top of per-item
+			// exponential backoff so a fan-out storm is smoothed, not stampeded.
+			RateLimiter: nodeQueueRateLimiter(r.NodeQueueQPS, r.NodeQueueBurst),
+		}).
 		For(&corev1.Node{}, builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
 				log := ctrl.LoggerFrom(ctx)
@@ -71,6 +89,16 @@ func (r *NodeReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager)
 				taintsChanged := !taintsEqual(oldNode.Spec.Taints, newNode.Spec.Taints)
 				labelsChanged := !labelsEqual(oldNode.Labels, newNode.Labels)
 
+				// Self-write filter: this controller always mutates a taint and the
+				// ownership ledger in the same patch. An update whose only change is
+				// our ledger moving in lockstep (no condition/label change) is our own
+				// write echoing back; skip it to avoid self-induced reconciles. An
+				// external actor touching our taint leaves the ledger unchanged, so it
+				// still triggers a reconcile.
+				if !ownedTaintsEqual(oldNode, newNode) && !conditionsChanged && !labelsChanged {
+					return false
+				}
+
 				shouldReconcile := conditionsChanged || taintsChanged || labelsChanged
 
 				if shouldReconcile {
@@ -84,7 +112,70 @@ func (r *NodeReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager)
 				return shouldReconcile
 			},
 		})).
+		// Watch rules: when a rule changes, rebuild the snapshot and enqueue the
+		// nodes it selects so the (sole-writer) Node reconciler applies the change.
+		// Fire on spec changes AND when a rule enters deletion (Terminating, whose
+		// generation is unchanged) so the finalizer barrier's taints get swept.
+		Watches(&readinessv1alpha1.NodeReadinessRule{},
+			handler.EnqueueRequestsFromMapFunc(r.mapRuleToNodes),
+			builder.WithPredicates(predicate.Funcs{
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					genChanged := e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+					enteringDeletion := e.ObjectOld.GetDeletionTimestamp().IsZero() &&
+						!e.ObjectNew.GetDeletionTimestamp().IsZero()
+					return genChanged || enteringDeletion
+				},
+			})).
 		Complete(r)
+}
+
+// nodeQueueRateLimiter combines per-item exponential backoff with an optional
+// overall token-bucket limit. The bucket bounds the rate of RATE-LIMITED
+// enqueues (error requeues via AddRateLimited); event-driven enqueues from the
+// informer use Add and are not throttled, so a broad rule change still fans out
+// at full speed. qps <= 0 disables the overall bucket (per-item backoff only).
+func nodeQueueRateLimiter(qps float64, burst int) workqueue.TypedRateLimiter[reconcile.Request] {
+	perItem := workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](5*time.Millisecond, 1000*time.Second)
+	if qps <= 0 || burst <= 0 {
+		return perItem
+	}
+	return workqueue.NewTypedMaxOfRateLimiter(
+		perItem,
+		&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(qps), burst)},
+	)
+}
+
+// mapRuleToNodes rebuilds the rule snapshot FIRST, then enqueues the nodes the
+// changed rule selects. Rebuild-before-enqueue guarantees the ensuing node
+// reconciles read the new rule state, never a stale snapshot.
+//
+// A rule whose selector was narrowed by an edit leaves ex-matched nodes
+// un-enqueued here; those are swept by the SyncPeriod resync (and, for a node
+// relabel, by the Node's own watch). Deleted rules still carry their last-known
+// selector on the delete event, so their nodes are enqueued and later GC'd.
+func (r *NodeReconciler) mapRuleToNodes(ctx context.Context, obj client.Object) []reconcile.Request {
+	if err := r.Controller.RebuildSnapshot(ctx); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "failed to rebuild rule snapshot for node enqueue")
+		return nil
+	}
+	rule, ok := obj.(*readinessv1alpha1.NodeReadinessRule)
+	if !ok {
+		return nil
+	}
+	selector, err := metav1.LabelSelectorAsSelector(&rule.Spec.NodeSelector)
+	if err != nil {
+		return nil
+	}
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "failed to list nodes for rule", "rule", rule.Name)
+		return nil
+	}
+	reqs := make([]reconcile.Request, len(nodeList.Items))
+	for i := range nodeList.Items {
+		reqs[i] = reconcile.Request{NamespacedName: types.NamespacedName{Name: nodeList.Items[i].Name}}
+	}
+	return reqs
 }
 
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch;update;patch
@@ -102,8 +193,19 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Process node against all applicable rules
+	// Apply/remove taints per applicable rules (positive proof of readiness).
 	if err := r.Controller.processNodeAgainstAllRules(ctx, node); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Fail-closed sweep of taints we applied that no live rule justifies
+	// (deleted rule, narrowed selector, relabel, or missed events during downtime).
+	if err := r.Controller.gcOrphanTaints(ctx, node); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Sweep bootstrap-completion annotations left by deleted rules.
+	if err := r.Controller.gcBootstrapAnnotations(ctx, node); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -170,80 +272,58 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 			"rule", rule.Name,
 			"resourceVersion", rule.ResourceVersion)
 
-		var successfullyPatchedRule *readinessv1alpha1.NodeReadinessRule
-
+		// Persist ONLY this node's failure state, and ONLY when it changes. The
+		// per-node NodeEvaluations array is no longer written (it was cluster-sized
+		// and could exceed the etcd object limit); aggregate counts live on the
+		// rule status, per-node detail on the Node / NodeReadinessEvaluation.
+		// Skipping no-op patches keeps steady-state reconciles write-free (no O(n^2)
+		// fan-out).
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			latestRule := &readinessv1alpha1.NodeReadinessRule{}
 			if err := r.Get(ctx, client.ObjectKey{Name: rule.Name}, latestRule); err != nil {
 				return err
 			}
 
-			patch := client.MergeFrom(latestRule.DeepCopy())
-
-			// update only this specific node evaluation status
-			currEval := readinessv1alpha1.NodeEvaluation{}
-			for _, eval := range rule.Status.NodeEvaluations {
-				if eval.NodeName == node.Name {
-					currEval = eval
-					break
-				}
-			}
-
-			found := false
-			for i := range latestRule.Status.NodeEvaluations {
-				if latestRule.Status.NodeEvaluations[i].NodeName == node.Name {
-					latestRule.Status.NodeEvaluations[i] = currEval
-					found = true
-					break
-				}
-			}
-			if !found {
-				latestRule.Status.NodeEvaluations = append(
-					latestRule.Status.NodeEvaluations,
-					currEval,
-				)
-			}
-
-			// handle status.FailedNodes for this node
-			var updatedFailedNodes []readinessv1alpha1.NodeFailure
+			updated := make([]readinessv1alpha1.NodeFailure, 0, len(latestRule.Status.FailedNodes))
 			for _, failure := range latestRule.Status.FailedNodes {
 				if failure.NodeName != node.Name {
-					updatedFailedNodes = append(updatedFailedNodes, failure)
+					updated = append(updated, failure)
 				}
 			}
 			for _, failure := range rule.Status.FailedNodes {
 				if failure.NodeName == node.Name {
-					updatedFailedNodes = append(updatedFailedNodes, failure)
+					updated = append(updated, failure)
 				}
 			}
-			latestRule.Status.FailedNodes = updatedFailedNodes
-
-			if err := r.Status().Patch(ctx, latestRule, patch); err != nil {
-				return err
+			if failedNodesEqual(latestRule.Status.FailedNodes, updated) {
+				return nil // no change for this node -> no write
 			}
 
-			successfullyPatchedRule = latestRule
-			return nil
+			// Bound the stored list so the status object stays O(1) and never
+			// exceeds the schema's MaxItems=100 (a larger Patch is rejected by the
+			// API server). failedCount carries the untruncated total. Sort by node
+			// name first so the retained subset is deterministic, not dependent on
+			// map/iteration order.
+			totalFailed := len(updated)
+			truncated := false
+			if totalFailed > maxFailedNodesInStatus {
+				sort.Slice(updated, func(i, j int) bool {
+					return updated[i].NodeName < updated[j].NodeName
+				})
+				updated = updated[:maxFailedNodesInStatus]
+				truncated = true
+			}
+
+			patch := client.MergeFrom(latestRule.DeepCopy())
+			latestRule.Status.FailedNodes = updated
+			latestRule.Status.FailedCount = int32(totalFailed)
+			latestRule.Status.FailedTruncated = truncated
+			return r.Status().Patch(ctx, latestRule, patch)
 		})
-
 		if err != nil {
-			log.Error(err, "Failed to update rule status after node evaluation",
-				"node", node.Name,
-				"rule", rule.Name,
-				"resourceVersion", rule.ResourceVersion)
-			// continue with other rules
+			log.Error(err, "Failed to update rule failure status after node evaluation",
+				"node", node.Name, "rule", rule.Name)
 			errs = append(errs, err)
-		} else {
-			log.V(4).Info("Successfully persisted rule status from node reconciler",
-				"node", node.Name,
-				"rule", rule.Name,
-				"newResourceVersion", rule.ResourceVersion)
-
-			if r.EnableNodeStateMetrics {
-				if successfullyPatchedRule != nil {
-					r.SyncNodeStateMetrics(ctx, successfullyPatchedRule)
-				}
-			}
 		}
 	}
 
@@ -311,6 +391,9 @@ func (r *RuleReadinessController) addTaintBySpec(ctx context.Context, node *core
 
 		stored := latestNode.DeepCopy()
 		latestNode.Spec.Taints = append(latestNode.Spec.Taints, taintSpec)
+		// Record ownership in the same patch as the taint so provenance and the
+		// taint can never diverge (fail-closed GC depends on this).
+		addOwnedTaint(latestNode, taintSpec)
 		if err := r.Patch(ctx, latestNode, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 			return err
 		}
@@ -325,9 +408,42 @@ func (r *RuleReadinessController) addTaintBySpec(ctx context.Context, node *core
 		return nil
 	})
 	if err != nil {
+		r.EventRecorder.Eventf(node, nil, corev1.EventTypeWarning, "TaintAddFailed", "AddTaint",
+			"failed to add taint '%s:%s' for rule '%s': %v", taintSpec.Key, taintSpec.Effect, rule.Name, err)
 		return false, err
 	}
 	return added, nil
+}
+
+// claimTaintOwnership records the taint in the node's ownership ledger when it
+// is not already present. Used when adopting a taint that is already on the node
+// (so it was not stamped by addTaintBySpec), so fail-closed GC can later sweep
+// it if the rule goes away. Idempotent and safe under concurrent node writes.
+func (r *RuleReadinessController) claimTaintOwnership(ctx context.Context, node *corev1.Node, taint corev1.Taint) (bool, error) {
+	if _, ok := ownedTaintIDs(node)[taintID(taint)]; ok {
+		return false, nil
+	}
+	claimed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		claimed = false
+		latest := &corev1.Node{}
+		if err := r.Get(ctx, client.ObjectKey{Name: node.Name}, latest); err != nil {
+			return err
+		}
+		if _, ok := ownedTaintIDs(latest)[taintID(taint)]; ok {
+			*node = *latest
+			return nil
+		}
+		stored := latest.DeepCopy()
+		addOwnedTaint(latest, taint)
+		if err := r.Patch(ctx, latest, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		*node = *latest
+		claimed = true
+		return nil
+	})
+	return claimed, err
 }
 
 // removeTaintBySpec removes a taint from a node.
@@ -395,6 +511,8 @@ func (r *RuleReadinessController) removeTaint(ctx context.Context, node *corev1.
 				}
 			}
 			latestNode.Spec.Taints = newTaints
+			// Drop the ownership record in the same patch as the taint removal.
+			removeOwnedTaint(latestNode, taintSpec)
 		}
 		if latestNode.Annotations == nil && hasNewAnnotations {
 			latestNode.Annotations = make(map[string]string)
@@ -417,6 +535,8 @@ func (r *RuleReadinessController) removeTaint(ctx context.Context, node *corev1.
 		return nil
 	})
 	if err != nil {
+		r.EventRecorder.Eventf(node, nil, corev1.EventTypeWarning, "TaintRemoveFailed", "RemoveTaint",
+			"failed to remove taint '%s:%s' for rule '%s': %v", taintSpec.Key, taintSpec.Effect, ruleName, err)
 		return false, err
 	}
 	return hasNewAnnotations, nil
@@ -530,27 +650,4 @@ func (r *RuleReadinessController) clearNodeFailure(rule *readinessv1alpha1.NodeR
 		}
 	}
 	rule.Status.FailedNodes = failedNodes
-}
-
-// SyncNodeStateMetrics synchronizes the NodesByState Prometheus metrics with the current rule status.
-func (r *RuleReadinessController) SyncNodeStateMetrics(ctx context.Context, rule *readinessv1alpha1.NodeReadinessRule) {
-	var ready, notReady, bootstrapping float64
-
-	for _, eval := range rule.Status.NodeEvaluations {
-		if eval.TaintStatus == readinessv1alpha1.TaintStatusAbsent {
-			ready++
-		} else {
-			// The taint is still present.
-			if rule.Spec.EnforcementMode == readinessv1alpha1.EnforcementModeBootstrapOnly {
-				// In BootstrapOnly mode, if the taint is present, it is still bootstrapping.
-				bootstrapping++
-			} else {
-				notReady++
-			}
-		}
-	}
-
-	metrics.NodesByState.WithLabelValues(rule.Name, string(metrics.NodeStateReady)).Set(ready)
-	metrics.NodesByState.WithLabelValues(rule.Name, string(metrics.NodeStateNotReady)).Set(notReady)
-	metrics.NodesByState.WithLabelValues(rule.Name, string(metrics.NodeStateBootstrapping)).Set(bootstrapping)
 }
